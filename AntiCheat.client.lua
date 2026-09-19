@@ -15,6 +15,79 @@ local TextChatService = game:GetService("TextChatService")
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
 
+-- Teardown registry. Declared unconditionally and BEFORE the gate below, because the rest of the
+-- file uses it: if the gate block gets removed, the file must still load rather than dying with
+-- "invalid argument #1 to 'insert' (table expected, got nil)".
+local teardown: { () -> () } = {}
+local revoked = false
+local function revokeAll(reason: string)
+	if revoked then
+		return
+	end
+	revoked = true
+	warn("[AC] " .. reason .. " - shutting down.")
+	for _, fn in teardown do
+		pcall(fn)
+	end
+end
+
+-- ===== TEST-MODE GATE =====
+--   1. Studio                                  -> allowed
+--   2. ACTestBridge published true              -> allowed (full harness)
+--   3. ACTestBridge published false             -> refused (an explicit server "no" wins)
+--   4. no bridge, and you own this game          -> allowed, degraded (tests can't score)
+--      (or your account is in ALLOWED_USER_IDS - e.g. an alt you test with)
+--   5. anything else                            -> refused
+local OWNED_GROUP_IDS: { number } = {}  -- group IDs, if the place is group-owned
+local ALLOWED_USER_IDS: { number } = {} -- alt accounts you test your own game with
+
+local function ownsThisGame(): boolean
+	if table.find(ALLOWED_USER_IDS, player.UserId) then
+		return true
+	end
+	if game.CreatorType == Enum.CreatorType.User then
+		return game.CreatorId == player.UserId
+	end
+	return table.find(OWNED_GROUP_IDS, game.CreatorId) ~= nil
+end
+
+local AC_ENABLED, AC_DEGRADED = false, false
+do
+	local deadline = os.clock() + 5
+	while ReplicatedStorage:GetAttribute("ACTestMode") == nil and os.clock() < deadline do
+		task.wait(0.25)
+	end
+	local published = ReplicatedStorage:GetAttribute("ACTestMode")
+	local why
+	if RunService:IsStudio() then
+		AC_ENABLED, why = true, "Studio"
+	elseif published == true then
+		AC_ENABLED, why = true, "server enabled test mode"
+	elseif published == false then
+		AC_ENABLED, why = false, "server has test mode disabled"
+	elseif ownsThisGame() then
+		AC_ENABLED, AC_DEGRADED, why = true, true, "your game"
+	else
+		AC_ENABLED, why = false, "not your game, and no server opt-in"
+	end
+	if not AC_ENABLED then
+		warn(("[AC] Refusing to run: %s. PlaceId=%d creator=%d you=%d")
+			:format(why, game.PlaceId, game.CreatorId, player.UserId))
+		warn("[AC] Testing on an alt? Add its UserId to ALLOWED_USER_IDS near the top of this file.")
+		return
+	end
+	print(("[AC] Test mode: %s"):format(why))
+	if AC_DEGRADED then
+		warn("[AC] ACTestBridge not installed: automation works, but tests report MISSED until it is.")
+	end
+end
+
+ReplicatedStorage:GetAttributeChangedSignal("ACTestMode"):Connect(function()
+	if ReplicatedStorage:GetAttribute("ACTestMode") == false then
+		revokeAll("Server revoked test mode")
+	end
+end)
+
 -- ===== SELF-IDENTIFICATION (so the scanner doesn't report this tool as game data) =====
 -- The getgc scan walks every live object, which includes this script's own tables and closures.
 -- Without this, the report lists our settings table as "quest data" and our own field names
@@ -275,8 +348,16 @@ local ADAPT = {
 	SkillRemote = "",       -- if "", skills are sent as key presses instead
 	StatRemote = "",        -- fired as StatRemote:FireServer(statName, amount)
 	SellRemote = "",        -- fired as SellRemote:FireServer(itemName)
-	AcceptQuestRemote = "",
-	CompleteQuestRemote = "",
+	-- Quests, from the recorder. Everything goes through the same multiplexed signal:
+	--   accept:   ("AddQuest", "<dialogue choice text>")  e.g. "Ill take 3 bandits" - NOT the quest name
+	--   dialogue: ("NpcTalking", "Ended")                 the real client sends this when a chat closes
+	--   removed:  ("RemoveQuest", "<objective>")          seen once; turn-in vs abandon is unconfirmed,
+	--                                                     so it is NOT wired as the completion call
+	AcceptQuestRemote = "Communication.ServerAndClient.Signals.SignalEvent.Event",
+	CompleteQuestRemote = "", -- no turn-in call captured yet; the loop hands in by talking to the NPC
+	DialogueRemote = "Communication.ServerAndClient.Signals.SignalEvent.Event",
+	-- Equip, from the recorder: ("Item_Equip", slot). Player.Items_Config.Equipped is 0 when empty.
+	EquipRemote = "Communication.ServerAndClient.Signals.SignalEvent.Event",
 	-- Quest loop hooks. All optional; defaults are guesses until you fill them in.
 	-- Name of the NPC model that gives/claims a quest.
 	-- Return the NPC model name for a quest, or "" to let the loop work it out from the game's
@@ -311,7 +392,19 @@ local ADAPT = {
 		end
 		lastSwing = now
 		comboIdx = comboIdx % 4 + 1
-		return { "Combat_Service", "Combat", comboIdx, false, 0.13, false, nil, n = 7 }
+		-- 5th arg: recorded as 0.13 on combo hit 1 and 0 on hit 2, so it is not a constant.
+		-- Matching the observed pattern until more samples show what it actually encodes.
+		return { "Combat_Service", "Combat", comboIdx, false, comboIdx == 1 and 0.13 or 0, false, nil, n = 7 }
+	end,
+	-- Accept args. `acceptText` is the dialogue option you click, which is what the server gets.
+	-- (S is declared later in the file, so the loop passes the setting in.)
+	BuildAcceptArgs = function(_questName: string, acceptText: string): { any }
+		return { "AddQuest", acceptText }
+	end,
+	-- Only used if you set CompleteQuestRemote. ("RemoveQuest", objective) was recorded once, but
+	-- if that is the abandon call, wiring it here would abandon every quest instead of handing in.
+	BuildCompleteArgs = function(questName: string): { any }
+		return { "RemoveQuest", questName }
 	end,
 	-- Return the number of unspent stat points (read your leaderstats / attribute).
 	GetStatPoints = function(): number
@@ -1524,9 +1617,21 @@ local S = {
 	-- never engaged even when they classify as an enemy (training dummies, townsfolk, mounts)
 	ExcludeNames = "Civilian,statue,Horse,Dummy,Trainer,Trainee",
 	AttackRange = 12, -- don't swing from further than this (a miss is a wasted, flaggable action)
+	-- Where to stand while fighting: "side" (FightDistance out, FarmHeight up), "above" or "below"
+	-- (straight over/under the target at HoverHeight). above/below keep you out of melee reach, so
+	-- they test whether your server validates the vertical distance of a hit, not just the range.
+	FarmPosition = "side", HoverHeight = 8,
+	AimPitch = true, -- above/below: tilt to aim at the target instead of only turning toward it
 	LeashRange = 120, -- give up on the current target once it gets this far away
 	-- quests
-	AutoQuest = false, QuestName = "", SideQuests = false, SideQuestName = "", QuestActionSeconds = 30,
+	AutoQuest = false, QuestName = "Defeat 3 bandits", SideQuests = false, SideQuestName = "", QuestActionSeconds = 30,
+	QuestNPC = "",                         -- model name of the NPC that gives the quest (blank = use quest markers)
+	NpcPromptActions = "Chat,Talk,Speak",  -- prompt ActionTexts that mean "talkable NPC" (directory)
+	TravelTo = "",                         -- NPC name to travel to (Quests tab); clears on arrival
+	QuestAcceptText = "Ill take 3 bandits", -- the dialogue option the accept call sends (recorded)
+	QuestSkipDialogue = false,             -- true = send AddQuest without opening the NPC chat first
+	DialogueDelay = 0.8,                   -- seconds "reading" the dialogue before choosing (humanized)
+	EquipSlot = 1,                         -- slot sent with Item_Equip
 	-- stats
 	AutoStats = false, StatPriority = "Strength,Defense", PointReserve = 0,
 	-- movement
@@ -1725,6 +1830,101 @@ local function rootOf(m: Instance): BasePart?
 	return nil
 end
 
+-- ===== NPC DIRECTORY =====
+-- Remembers every talkable NPC the client has ever seen, with its position, so quests don't need
+-- you to walk to each giver first. With StreamingEnabled, far-away NPCs are not on the client at
+-- all; the directory keeps their last known position after their area unloads, and the quest
+-- loop travels there so they stream back in.
+--   npcs:   name -> { x, y, z, action, seen }   (seen = os.time of last sighting)
+--   givers: quest objective -> NPC name        learned automatically on each successful accept
+-- Event-driven (DescendantAdded) plus one initial pass, so it costs nothing per frame. Persisted
+-- to ACNpcDirectory.json and merged across sessions.
+type NpcEntry = { x: number, y: number, z: number, action: string, seen: number }
+local NPC_FILE = "ACNpcDirectory.json"
+local npcDir: { [string]: NpcEntry } = claim({})
+local questGivers: { [string]: string } = claim({})
+local npcDirDirty = false
+
+local function saveNpcDir()
+	if not (npcDirDirty and env.writefile) then
+		return
+	end
+	npcDirDirty = false
+	pcall(function()
+		env.writefile(NPC_FILE, HttpService:JSONEncode({ npcs = npcDir, givers = questGivers }))
+	end)
+end
+
+local function loadNpcDir()
+	if not (env.isfile and env.readfile and env.isfile(NPC_FILE)) then
+		return
+	end
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(env.readfile(NPC_FILE))
+	end)
+	if not (ok and type(data) == "table") then
+		return
+	end
+	for name, e in type(data.npcs) == "table" and data.npcs or {} do
+		if type(e) == "table" and type(e.x) == "number" and not npcDir[name] then
+			npcDir[name] = e
+		end
+	end
+	for quest, npc in type(data.givers) == "table" and data.givers or {} do
+		if type(npc) == "string" then
+			questGivers[quest] = npc
+		end
+	end
+end
+
+local function isTalkPrompt(pr: ProximityPrompt): boolean
+	return matches(pr.ActionText, split(S.NpcPromptActions))
+end
+
+local function noteNpcPrompt(pr: Instance)
+	if not pr:IsA("ProximityPrompt") or not isTalkPrompt(pr) then
+		return
+	end
+	local model = pr:FindFirstAncestorOfClass("Model")
+	if not (model and model:FindFirstChildOfClass("Humanoid")) or Players:GetPlayerFromCharacter(model) then
+		return
+	end
+	local r = rootOf(model)
+	if not r then
+		return
+	end
+	local p = r.Position
+	npcDir[model.Name] = { x = p.X, y = p.Y, z = p.Z, action = pr.ActionText, seen = os.time() }
+	npcDirDirty = true
+end
+
+loadNpcDir()
+workspace.DescendantAdded:Connect(function(d)
+	if d:IsA("ProximityPrompt") then
+		-- deferred: the prompt can arrive before the rest of its NPC model has replicated
+		task.defer(pcall, noteNpcPrompt, d)
+	end
+end)
+task.spawn(function()
+	for i, d in workspace:GetDescendants() do
+		if d:IsA("ProximityPrompt") then
+			pcall(noteNpcPrompt, d)
+		end
+		if i % 4000 == 0 then
+			task.wait() -- initial pass over a big map shouldn't hitch the client
+		end
+	end
+	while not revoked do
+		task.wait(10)
+		saveNpcDir()
+	end
+end)
+
+local function npcPosition(name: string): Vector3?
+	local e = npcDir[name]
+	return e and Vector3.new(e.x, e.y, e.z) or nil
+end
+
 -- Target stickiness: a real player commits to one enemy until it dies or gets away. Re-picking
 -- every frame makes two equidistant enemies flip-flop, so nothing ever actually dies - and
 -- constant target switching is itself a strong automation signal.
@@ -1804,8 +2004,16 @@ end
 -- Builds a CFrame at `pos` facing `lookAt` (flattened to the XZ plane, so the character stays
 -- upright). Falls back to `fallback`'s rotation when there is nothing meaningful to face,
 -- which matters because writing CFrame.new(pos) would silently drop all orientation.
-local function facing(pos: Vector3, lookAt: Vector3?, fallback: CFrame): CFrame
+local function facing(pos: Vector3, lookAt: Vector3?, fallback: CFrame, pitch: boolean?): CFrame
 	if lookAt then
+		if pitch and (lookAt - pos).Magnitude > 0.05 then
+			-- Full 3D aim (tilts the root up/down). When the target is straight above or below,
+			-- the default up-vector is parallel to the aim and lookAt degenerates, so the current
+			-- look direction is used as the up-vector instead.
+			local flat = Vector3.new(lookAt.X - pos.X, 0, lookAt.Z - pos.Z)
+			local up = flat.Magnitude > 0.05 and Vector3.yAxis or fallback.LookVector
+			return CFrame.lookAt(pos, lookAt, up)
+		end
 		local flat = Vector3.new(lookAt.X - pos.X, 0, lookAt.Z - pos.Z)
 		if flat.Magnitude > 0.05 then
 			return CFrame.lookAt(pos, pos + flat.Unit)
@@ -1817,13 +2025,13 @@ end
 -- `lookAt` keeps the character oriented at a point (normally the enemy) independently of the
 -- direction of travel. Combat relies on this: the game's attack call carries no target, so the
 -- server resolves hits from where the character is facing.
-local function moveToward(goal: Vector3, dt: number, lookAt: Vector3?)
+local function moveToward(goal: Vector3, dt: number, lookAt: Vector3?, pitch: boolean?)
 	local root = getRoot()
 	if not root then
 		return
 	end
 	if S.InstantTravel then
-		root.CFrame = facing(goal, lookAt, root.CFrame)
+		root.CFrame = facing(goal, lookAt, root.CFrame, pitch)
 	else
 		local delta = goal - root.Position
 		local speed = S.TweenSpeed
@@ -1840,16 +2048,16 @@ local function moveToward(goal: Vector3, dt: number, lookAt: Vector3?)
 		local step = speed * dt
 		local pos = delta.Magnitude <= step and goal or root.Position + delta.Unit * step + lateral
 		-- face the explicit target if given, else the direction of travel, else keep facing
-		root.CFrame = facing(pos, lookAt or (delta.Magnitude > 0.1 and goal or nil), root.CFrame)
+		root.CFrame = facing(pos, lookAt or (delta.Magnitude > 0.1 and goal or nil), root.CFrame, lookAt ~= nil and pitch)
 	end
 	root.AssemblyLinearVelocity = Vector3.zero
 end
 
 -- Turns to face a target without moving (used when already in range).
-local function faceTarget(at: Vector3)
+local function faceTarget(at: Vector3, pitch: boolean?)
 	local root = getRoot()
 	if root then
-		root.CFrame = facing(root.Position, at, root.CFrame)
+		root.CFrame = facing(root.Position, at, root.CFrame, pitch)
 		root.AssemblyLinearVelocity = Vector3.zero
 	end
 end
@@ -1976,6 +2184,9 @@ local function clearESP()
 end
 local flightBV: BodyVelocity? = nil
 local lastFarmTarget: Model? = nil
+-- Set by the farm loop while fighting from below: the ground would otherwise push the character
+-- back out. Independent of the Noclip setting so it switches itself off when combat ends.
+local forceNoclip = false
 local engageAt = 0
 local lowHP = false
 local breakUntil: number? = nil
@@ -2014,7 +2225,8 @@ registerCleanup(restoreHitboxes)
 -- FindNPC -> GoToNPC -> Accept -> Objective -> Act (locate + perform) -> detect
 -- completion -> Return -> Claim -> next quest -> repeat
 local Q = { state = "Check", idx = 1, npc = nil :: Instance?, obj = nil :: { kind: string, target: string }?,
-	saved = nil :: { [string]: any }?, since = os.clock(), acting = false, name = "", kills = 0 }
+	saved = nil :: { [string]: any }?, since = os.clock(), acting = false, name = "", kills = 0,
+	pending = false, claimed = false, claimedAt = 0 }
 local QUEST_KEYS = { "Targets", "AutoLoot", "LootNames", "TravelToLoot", "CollectRadius" }
 
 local function setState(s: string)
@@ -2054,14 +2266,30 @@ local function nextQuestName(): string?
 	return list[Q.idx]
 end
 
+-- The NPC name a quest should come from, if known: your QuestNPC setting, else the giver
+-- learned the last time this quest was accepted, else ADAPT.QuestNPCName.
+local function giverFor(questName: string): string?
+	if S.QuestNPC ~= "" then
+		return S.QuestNPC
+	end
+	local learned = questGivers[questName]
+	if learned then
+		return learned
+	end
+	local named = ADAPT.QuestNPCName(questName)
+	return (named and named ~= "") and named or nil
+end
+
 -- Finds the NPC for a quest, in descending order of confidence:
---   1. the name ADAPT.QuestNPCName gives, if it yields a non-empty name
+--   1. the known giver (see giverFor)
 --   2. an NPC the game itself is tracking in markergui (these are the ones with quest markers)
 --   3. any NPC that classifies as a quest giver
+-- If the giver is known but not currently streamed in, returns nil instead of settling for some
+-- other NPC: the directory knows where it is, so the loop travels there rather than guessing.
 local function findNPC(questName: string): Instance?
 	local want: { string } = {}
-	local named = ADAPT.QuestNPCName(questName)
-	if named and named ~= "" then
+	local named = giverFor(questName)
+	if named then
 		table.insert(want, named)
 	end
 	local marked = GameState.questMarkers().npcs
@@ -2080,6 +2308,9 @@ local function findNPC(questName: string): Instance?
 			end
 		end
 	end
+	if named and npcPosition(named) then
+		return nil -- known giver, just not loaded: travel to its remembered position instead
+	end
 	return byMarker or fallback
 end
 
@@ -2090,10 +2321,30 @@ local function interact(npc: Instance)
 	end
 end
 
+-- One NPC conversation, the way the game's own client produces it:
+--   press the Chat prompt -> dialogue opens -> (pause to read) -> pick an option -> NpcTalking Ended
+-- `choose` sends whatever the chosen option sends (AddQuest for an accept). With QuestSkipDialogue
+-- the prompt and the Ended message are left out, which is a useful variation to test on its own:
+-- a server that tracks dialogue state should reject an AddQuest with no open conversation.
+-- Runs inside task.spawn (it yields), never directly from the frame loop.
+local function converse(npc: Instance?, choose: () -> ())
+	if not S.QuestSkipDialogue and npc then
+		interact(npc)
+		task.wait(human(S.DialogueDelay))
+	end
+	choose()
+	if not S.QuestSkipDialogue and ADAPT.DialogueRemote ~= "" then
+		task.wait(human(0.35))
+		fire(ADAPT.DialogueRemote, "NpcTalking", "Ended")
+	end
+end
+
 local function questStep(root: BasePart, dt: number)
 	if not S.AutoQuest then
 		if Q.saved or Q.state ~= "Check" then
 			questRestore()
+			-- a stale hand-in flag would make the next Claim skip talking to the NPC
+			Q.claimed = false
 			setState("Check")
 		end
 		return
@@ -2124,14 +2375,22 @@ local function questStep(root: BasePart, dt: number)
 			return
 		end
 		Q.name = name
+		-- Head for the giver's remembered position every frame (smooth travel), but only
+		-- re-search the workspace twice a second: the search walks every descendant.
+		local giver = giverFor(name)
+		local remembered = giver and npcPosition(giver)
+		if remembered and (remembered - root.Position).Magnitude > 20 then
+			moveToward(remembered, dt)
+		end
 		if not due("questFind", 0.5) then
-			return -- the NPC search walks the workspace, so don't run it every frame
+			return
 		end
 		Q.npc = findNPC(name)
 		if Q.npc then
 			setState("GoToNPC")
-		elseif due("questWarn", 5) then
-			warn("[ACMenu] Quest NPC not found: " .. ADAPT.QuestNPCName(name))
+		elseif not remembered and due("questWarn", 5) then
+			warn(("[ACMenu] Quest NPC for %q not found and not in the directory. Set Quest NPC name, "
+				.. "or walk near it once so it gets recorded."):format(name))
 		end
 
 	elseif Q.state == "GoToNPC" or Q.state == "Return" then
@@ -2147,10 +2406,34 @@ local function questStep(root: BasePart, dt: number)
 		end
 
 	elseif Q.state == "Accept" then
-		interact(Q.npc :: Instance)
-		fire(ADAPT.AcceptQuestRemote, Q.name)
-		bump("questAccept")
-		setState("Objective")
+		if not Q.pending then
+			Q.pending = true
+			local npc, name = Q.npc, Q.name
+			task.spawn(function()
+				local ok, err = pcall(function()
+					local args = ADAPT.AcceptQuestRemote ~= ""
+						and ADAPT.BuildAcceptArgs(name, S.QuestAcceptText) :: any or nil
+					converse(npc, function()
+						if args then
+							fire(ADAPT.AcceptQuestRemote, table.unpack(args, 1, args.n or #args))
+						end
+					end)
+				end)
+				Q.pending = false
+				if not ok then
+					warn("[ACMenu] quest accept failed: " .. tostring(err))
+				end
+				if ok and npc and npc.Parent then
+					-- remember who gives this quest, so next time the loop goes straight there
+					questGivers[name] = npc.Name
+					npcDirDirty = true
+				end
+				if S.AutoQuest and Q.state == "Accept" then -- not switched off mid-conversation
+					bump("questAccept")
+					setState("Objective")
+				end
+			end)
+		end
 
 	elseif Q.state == "Objective" then
 		if elapsed < 0.7 then
@@ -2206,13 +2489,25 @@ local function questStep(root: BasePart, dt: number)
 		end
 
 	elseif Q.state == "Claim" then
-		if not Q.claimed then
-			Q.claimed = true
-			interact(Q.npc :: Instance)
-			fire(ADAPT.CompleteQuestRemote, Q.name)
-			bump("questClaim")
-			Q.idx += 1
-		elseif elapsed > 1 then
+		if not Q.claimed and not Q.pending then
+			Q.pending = true
+			local npc, name = Q.npc, Q.name
+			task.spawn(function()
+				-- Hand in by talking to the NPC. If a turn-in call gets recorded and set as
+				-- CompleteQuestRemote, it is sent as the dialogue choice here.
+				pcall(converse, npc, function()
+					if ADAPT.CompleteQuestRemote ~= "" then
+						local args = ADAPT.BuildCompleteArgs(name) :: any
+						fire(ADAPT.CompleteQuestRemote, table.unpack(args, 1, args.n or #args))
+					end
+				end)
+				Q.pending = false
+				Q.claimed, Q.claimedAt = true, os.clock()
+				bump("questClaim")
+				Q.idx += 1
+			end)
+		elseif Q.claimed and os.clock() - Q.claimedAt > 1.5 then
+			-- give the server a moment to remove the marker before re-checking
 			Q.claimed = false
 			setState("Check")
 		end
@@ -2275,12 +2570,23 @@ local function tick(dt: number, root: BasePart, hum: Humanoid)
 
 
 	-- weapon equip
-	if S.AutoEquip and due("equip", 1) and not hum.Parent:FindFirstChildOfClass("Tool") then
-		for _, t in player.Backpack:GetChildren() do
-			if t:IsA("Tool") and (S.WeaponName == "" or t.Name:lower():find(S.WeaponName:lower(), 1, true)) then
-				hum:EquipTool(t)
+	-- This game equips through its own item system (Player.Items_Config.Equipped, 0 = nothing
+	-- equipped) rather than Roblox Tools, so the recorded Item_Equip call is used when available.
+	if S.AutoEquip and due("equip", 1) then
+		local cfg = player:FindFirstChild("Items_Config")
+		local equipped = cfg and cfg:FindFirstChild("Equipped")
+		if equipped and equipped:IsA("ValueBase") and ADAPT.EquipRemote ~= "" then
+			if (equipped :: any).Value == 0 and fire(ADAPT.EquipRemote, "Item_Equip", S.EquipSlot) then
 				bump("equip")
-				break
+			end
+		elseif hum.Parent and not hum.Parent:FindFirstChildOfClass("Tool") then
+			local backpack = player:FindFirstChildOfClass("Backpack")
+			for _, t in backpack and backpack:GetChildren() or {} do
+				if t:IsA("Tool") and (S.WeaponName == "" or t.Name:lower():find(S.WeaponName:lower(), 1, true)) then
+					hum:EquipTool(t)
+					bump("equip")
+					break
+				end
 			end
 		end
 	end
@@ -2336,20 +2642,32 @@ local function tick(dt: number, root: BasePart, hum: Humanoid)
 	end
 	lastFarmTarget = farmTarget
 
+	local wantNoclip = false
 	if farmTarget and os.clock() >= engageAt then
 		local r = rootOf(farmTarget)
 		if r then
-			-- approach from our own side: FightDistance studs out, FarmHeight studs up
-			local away = root.Position - r.Position
-			local flat = Vector3.new(away.X, 0, away.Z)
-			local spot = r.Position + (flat.Magnitude > 0.1 and flat.Unit or Vector3.zAxis) * S.FightDistance
-			local goal = Vector3.new(spot.X, r.Position.Y + S.FarmHeight, spot.Z)
-			-- always face the enemy: the attack call carries no target, so the server
-			-- decides what was hit from facing and range
-			if (root.Position - goal).Magnitude > 0.5 then
-				moveToward(goal, dt, r.Position)
+			local mode = S.FarmPosition:lower()
+			local vertical = mode == "above" or mode == "below"
+			local goal
+			if vertical then
+				-- straight over / under the target, out of its melee reach
+				local h = math.abs(S.HoverHeight) * (mode == "below" and -1 or 1)
+				goal = r.Position + Vector3.new(0, h, 0)
+				wantNoclip = mode == "below" -- inside the floor: stop it pushing us back out
 			else
-				faceTarget(r.Position)
+				-- approach from our own side: FightDistance studs out, FarmHeight studs up
+				local away = root.Position - r.Position
+				local flat = Vector3.new(away.X, 0, away.Z)
+				local spot = r.Position + (flat.Magnitude > 0.1 and flat.Unit or Vector3.zAxis) * S.FightDistance
+				goal = Vector3.new(spot.X, r.Position.Y + S.FarmHeight, spot.Z)
+			end
+			-- always face the enemy: the attack call carries no target, so the server decides
+			-- what was hit from facing and range. From above/below, pitch so the aim points at it.
+			local pitch = vertical and S.AimPitch
+			if (root.Position - goal).Magnitude > 0.5 then
+				moveToward(goal, dt, r.Position, pitch)
+			else
+				faceTarget(r.Position, pitch)
 			end
 			-- Range is checked BEFORE dueH: dueH consumes its timer when it returns true, so
 			-- testing it first would silently eat swings while still closing the distance.
@@ -2359,6 +2677,7 @@ local function tick(dt: number, root: BasePart, hum: Humanoid)
 			end
 		end
 	end
+	forceNoclip = wantNoclip -- drops back automatically when there is no target / mode changes
 
 	-- kill aura
 	if S.KillAura and dueH("aura", interval) then
@@ -2418,6 +2737,19 @@ local function tick(dt: number, root: BasePart, hum: Humanoid)
 
 	-- quests
 	questStep(root, dt) -- every frame so quest travel is smooth, not 0.2s hops
+
+	-- manual "travel to NPC" from the Quests tab; clears itself on arrival
+	if S.TravelTo ~= "" then
+		local dest = npcPosition(S.TravelTo)
+		if not dest then
+			warn(("[ACMenu] %q is not in the NPC directory"):format(S.TravelTo))
+			S.TravelTo = ""
+		elseif (dest - root.Position).Magnitude > 8 then
+			moveToward(dest, dt)
+		else
+			S.TravelTo = ""
+		end
+	end
 
 	-- auto stats: spends points into the first priority stat, keeping the reserve
 	if S.AutoStats and ADAPT.StatRemote ~= "" and due("stats", 1) then
@@ -2622,6 +2954,9 @@ end
 -- cannot abort every feature after it, which previously happened on every frame once anything
 -- started erroring. Errors are reported at most once every few seconds instead of 60x/second.
 RunService.Heartbeat:Connect(function(dt)
+	if revoked then
+		return
+	end
 	local root, hum = getRoot(), getHum()
 	if not (root and hum) or hum.Health <= 0 then
 		return
@@ -2646,7 +2981,10 @@ local function restoreNoclip()
 end
 
 RunService.Stepped:Connect(function()
-	if S.Noclip then
+	if revoked then
+		return
+	end
+	if S.Noclip or forceNoclip then
 		local char = player.Character
 		if char then
 			for _, p in char:GetDescendants() do
@@ -2676,6 +3014,9 @@ end
 
 task.spawn(function()
 	while task.wait(1) do
+		if revoked then
+			break
+		end
 		if S.Fullbright then
 			if not origLighting then
 				origLighting = {
@@ -2696,6 +3037,9 @@ task.spawn(function()
 end)
 
 registerCleanup(restoreNoclip)
+registerCleanup(function()
+	forceNoclip = false
+end)
 registerCleanup(restoreLighting)
 registerCleanup(function()
 	if flightBV then
@@ -2713,6 +3057,12 @@ registerCleanup(function()
 		hum.WalkSpeed = baseSpeed
 	end
 	baseSpeed = nil
+end)
+
+-- Revoking test mode must leave the character exactly as it was found.
+table.insert(teardown, function()
+	stopAll()
+	runCleanups()
 end)
 
 -- anti-idle
@@ -2925,6 +3275,12 @@ local function buildMenu()
 		Text = "AC Test Lab  (RightShift hides)", TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold,
 		TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
 	}, header)
+	mk("TextLabel", {
+		Position = UDim2.fromScale(0.5, 0), Size = UDim2.new(0.5, -70, 1, 0), BackgroundTransparency = 1,
+		Text = ("● Test mode: %s"):format(RunService:IsStudio() and "Studio" or "private server"),
+		TextColor3 = C.good, Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Right,
+	}, header)
+
 	local sidebar = mk("ScrollingFrame", {
 		Position = UDim2.fromOffset(0, 30), Size = UDim2.new(0, 130, 1, -54), BackgroundColor3 = C.side, BorderSizePixel = 0,
 		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3,
@@ -3476,34 +3832,94 @@ local function buildMenu()
 		{ "Abilities and skills" },
 		{ "AutoSkills", "Auto skills" }, { "SkillKeys", "Skill keys (Z,X,C)" }, { "SkillInterval", "Skill interval (s)" },
 		{ "AutoParry", "Auto parry" }, { "ParryRange", "Parry range" },
-		{ "AutoEquip", "Weapon equip" }, { "WeaponName", "Weapon name" },
+		{ "AutoEquip", "Weapon equip" }, { "EquipSlot", "Equip slot (Item_Equip)" }, { "WeaponName", "Tool name (Tool-based games)" },
 		{ "Target selection" },
 		{ "Targets", "Targets (names, comma)" }, { "ExcludeNames", "Never attack (names, comma)" },
 		{ "TargetPriority", "Priority: nearest/lowest/highest/weakest" }, { "LeashRange", "Drop target beyond (studs)" },
 		{ "Attack preferences" },
 		{ "FightDistance", "Fight distance (studs)" }, { "AttackRange", "Max swing range (studs)" },
-		{ "FarmHeight", "Farm height (offset Y)" },
+		{ "FarmPosition", "Position: side / above / below" }, { "HoverHeight", "Above/below height (studs)" },
+		{ "AimPitch", "Tilt to aim (above/below)" }, { "FarmHeight", "Side: height offset (Y)" },
 		{ "SmartFarm", "Retreat at low HP" }, { "RetreatBelow", "Retreat below HP (0-1)" }, { "ResumeAbove", "Resume above HP (0-1)" },
 		{ "ReactionMin", "Reaction delay min (s)" }, { "ReactionMax", "Reaction delay max (s)" },
 		{ "Game hookup (blank = click M1 / press keys)" },
 		{ "AttackRemote", "Attack remote", ADAPT }, { "SkillRemote", "Skill remote", ADAPT }, { "ParryRemote", "Parry remote", ADAPT },
+		{ "EquipRemote", "Equip remote", ADAPT },
 	})
 
 	local questList = buildPage(pQuests, {
 		{ "Quest acceptance and progression" },
-		{ "AutoQuest", "Auto quests" }, { "QuestName", "Quest name" }, { "QuestActionSeconds", "Fallback timer (s)" },
+		{ "AutoQuest", "Auto quests" }, { "QuestName", "Quest (objective as shown)" }, { "QuestActionSeconds", "Fallback timer (s)" },
+		{ "QuestNPC", "Quest NPC name (blank = markers)" }, { "QuestAcceptText", "Accept option text" },
+		{ "QuestSkipDialogue", "Skip dialogue (test variation)" }, { "DialogueDelay", "Dialogue read delay (s)" },
 		{ "Quest priorities" },
 		{ "SideQuests", "Side quests" }, { "SideQuestName", "Side quest name" },
 		{ "Stat points" },
 		{ "AutoStats", "Auto stats" }, { "StatPriority", "Stat priorities" }, { "PointReserve", "Point reserve" },
-		{ "Game hookup (blank = walk to NPC and use its prompt)" },
-		{ "AcceptQuestRemote", "Accept quest remote", ADAPT }, { "CompleteQuestRemote", "Complete quest remote", ADAPT },
+		{ "Game hookup (recorded from your game)" },
+		{ "AcceptQuestRemote", "Accept quest remote", ADAPT }, { "CompleteQuestRemote", "Turn-in remote (blank = talk)", ADAPT },
+		{ "DialogueRemote", "Dialogue remote", ADAPT },
 		{ "StatRemote", "Stat remote", ADAPT },
 	})
 	sectionHeader(questList, "Live quest state (what the loop can actually see)")
-	local questDiag = textRow(questList, 78, "-")
+	local questDiag = textRow(questList, 110, "-")
 	questDiag.Font = Enum.Font.Code
 	questDiag.TextSize = 11
+
+	-- NPC directory: everything talkable seen so far, nearest first, with learned quest givers
+	sectionHeader(questList, "Known NPCs (recorded as you pass them; kept across sessions)")
+	settingRow(questList, "TravelTo", "Travel to NPC (type a name below)")
+	settingRow(questList, "NpcPromptActions", "Prompt actions that mean NPC")
+	local npcListRow = textRow(questList, 160, "(none recorded yet)")
+	npcListRow.Font = Enum.Font.Code
+	npcListRow.TextSize = 11
+	npcListRow.TextYAlignment = Enum.TextYAlignment.Top
+	actionRow(questList, {
+		{ "Copy NPC list", function()
+			local lines = {}
+			for name, e in npcDir do
+				table.insert(lines, ("%s\t%s\t%.0f, %.0f, %.0f"):format(name, e.action, e.x, e.y, e.z))
+			end
+			table.sort(lines)
+			local text = table.concat(lines, "\n")
+			print("[ACMenu] NPC directory:\n" .. text)
+			if env.setclipboard then
+				pcall(env.setclipboard, text)
+			end
+		end },
+		{ "Forget all", function()
+			table.clear(npcDir)
+			table.clear(questGivers)
+			npcDirDirty = true
+			saveNpcDir()
+		end },
+	})
+	local function refreshNpcList()
+		local root = getRoot()
+		local givesByNpc: { [string]: { string } } = {}
+		for quest, npc in questGivers do
+			givesByNpc[npc] = givesByNpc[npc] or {}
+			table.insert(givesByNpc[npc], quest)
+		end
+		local rows = {}
+		for name, e in npcDir do
+			local d = root and (Vector3.new(e.x, e.y, e.z) - root.Position).Magnitude or 0
+			table.insert(rows, { d = d, text = ("%-22s %6.0fm  %s"):format(
+				name:sub(1, 22), d, givesByNpc[name] and ("gives: " .. table.concat(givesByNpc[name], ", ")) or "") })
+		end
+		table.sort(rows, function(a, b)
+			return a.d < b.d
+		end)
+		local out = {}
+		for i, r in rows do
+			if i > 14 then
+				table.insert(out, ("... and %d more (Copy NPC list for all)"):format(#rows - 14))
+				break
+			end
+			table.insert(out, r.text)
+		end
+		npcListRow.Text = #out > 0 and table.concat(out, "\n") or "(none recorded yet - walk around and they get picked up)"
+	end
 
 	buildPage(pBosses, {
 		{ "Boss selection" },
@@ -3630,15 +4046,19 @@ local function buildMenu()
 		local mk = GameState.questMarkers()
 		local function questRemoteState(path: string): string
 			if path == "" then
-				return "not set - record one (see Settings > Scan game)"
+				return "not set - record one (Remotes > Record remote calls)"
 			end
 			local r = remote(path)
 			return r and ("ok (" .. r.ClassName .. ")") or "NOT FOUND"
 		end
+		refreshNpcList()
+		local qn = Q.name ~= "" and Q.name or S.QuestName
+		local giver = qn ~= "" and giverFor(qn) or nil
 		questDiag.Text = table.concat({
 			("state: %s   acting: %s   kills: %d"):format(Q.state, tostring(Q.acting), Q.kills),
 			("marker objective: %s"):format(mk.objective or "- (no active quest marker)"),
 			("marker NPCs: %s"):format(#mk.npcs > 0 and table.concat(mk.npcs, ", ") or "-"),
+			("quest giver: %s%s"):format(giver or "unknown", giver and (npcPosition(giver) and " (location known)" or " (not in directory yet)") or ""),
 			("parsed: %s"):format(p and ("%s %q %s/%s"):format(p.kind, p.target, tostring(p.current or "?"), tostring(p.needed or "?")) or "-"),
 			("accept remote:   %s"):format(questRemoteState(ADAPT.AcceptQuestRemote)),
 			("complete remote: %s"):format(questRemoteState(ADAPT.CompleteQuestRemote)),
