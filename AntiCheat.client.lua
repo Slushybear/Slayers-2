@@ -39,7 +39,7 @@ end
 --      (or your account is in ALLOWED_USER_IDS - e.g. an alt you test with)
 --   5. anything else                            -> refused
 local OWNED_GROUP_IDS: { number } = {}  -- group IDs, if the place is group-owned
-local ALLOWED_USER_IDS: { 6068872442 } = {} -- alt accounts you test your own game with
+local ALLOWED_USER_IDS: { 6068872442 } = {6068872442} -- alt accounts you test your own game with
 
 local function ownsThisGame(): boolean
 	if table.find(ALLOWED_USER_IDS, player.UserId) then
