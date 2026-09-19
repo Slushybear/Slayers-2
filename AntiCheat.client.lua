@@ -17,7 +17,7 @@ local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
 
 -- ===== SAFETY LOCK (same rules as AntiCheatTester) =====
-local ALLOWED_PLACE_IDS = { 16205713724 } -- matched against PlaceId and GameId
+local ALLOWED_PLACE_IDS = { 136406881576517 } -- matched against PlaceId and GameId
 local OWNED_GROUP_IDS = {}
 
 local function isMyGame()
