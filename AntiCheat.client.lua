@@ -12,26 +12,8 @@ local Lighting = game:GetService("Lighting")
 local HttpService = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TextChatService = game:GetService("TextChatService")
-
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
-
--- ===== SAFETY LOCK (same rules as AntiCheatTester) =====
-local ALLOWED_PLACE_IDS = { 136406881576517 } -- matched against PlaceId and GameId
-local OWNED_GROUP_IDS = {}
-
-local function isMyGame()
-	if game.CreatorType == Enum.CreatorType.User then
-		return game.CreatorId == player.UserId
-	end
-	return table.find(OWNED_GROUP_IDS, game.CreatorId) ~= nil
-end
-
-if not (RunService:IsStudio() or table.find(ALLOWED_PLACE_IDS, game.PlaceId)
-	or table.find(ALLOWED_PLACE_IDS, game.GameId) or isMyGame()) then
-	warn(("[ACMenu] Not your game, refusing to run. PlaceId=%d GameId=%d"):format(game.PlaceId, game.GameId))
-	return
-end
 
 -- ===== GAME STATE RECONSTRUCTION =====
 -- The server is authoritative, but it replicates a lot to the client: objects,
@@ -357,6 +339,12 @@ local CONFIG = {
 	JumpPowerValue = 200,
 	TeleportDistance = 500,
 	FlyHeight = 80,
+	-- Humanized movement (tune these around your server thresholds)
+	HumanDuration = 8,   -- seconds per humanized test
+	HumanSpeed = 30,     -- studs/sec; server MaxSpeedStuds is 40
+	HopStuds = 4,        -- studs per hop, one hop per 0.15s (~27 studs/sec)
+	HumanRiseMax = 9,    -- studs; server MaxAirRise is 12
+	HumanRiseRate = 4,   -- studs/sec while a burst is active
 }
 
 local results: { { name: string, detected: boolean, note: string } } = {}
@@ -404,7 +392,9 @@ local function runTest(name: string, action: (Humanoid, BasePart) -> (), wasReve
 			hum.JumpPower = 50
 		end)
 	end
-	player.CharacterAdded:Wait() -- fresh character between tests
+	if player.Character == startChar and (died or not startChar.Parent) then
+		player.CharacterAdded:Wait() -- fresh character between tests
+	end
 end
 
 local tests: { [string]: () -> () } = {}
@@ -478,6 +468,93 @@ tests.health = function()
 	end)
 end
 
+-- ===== HUMANIZED MOVEMENT TESTS =====
+-- Subtle movement meant to sit near or under your thresholds. Detection = the server pushed at
+-- least one flag (ACFlags) during the run, or reset the character. Each result records how many
+-- flags fired, so you can see how close a MISSED test came to being caught.
+local flagCount = 0
+task.spawn(function()
+	local flags = ReplicatedStorage:WaitForChild("ACFlags", 15)
+	if flags and flags:IsA("RemoteEvent") then
+		flags.OnClientEvent:Connect(function()
+			flagCount += 1
+		end)
+	end
+end)
+
+local moveRng = Random.new()
+
+local function runMoveTest(name: string, duration: number, step: (root: BasePart, dt: number, t: number) -> ())
+	local char, hum, root = getChar()
+	log("Running: " .. name)
+	local startChar = char
+	flagCount = 0
+	local t0 = os.clock()
+	while os.clock() - t0 < duration and player.Character == startChar and hum.Health > 0 do
+		local dt = RunService.Heartbeat:Wait()
+		step(root, dt, os.clock() - t0)
+	end
+	task.wait(CONFIG.ReactWindow)
+
+	local reset = player.Character ~= startChar or hum.Health <= 0
+	local detected = flagCount > 0 or reset
+	local note = ("%d flag(s)%s"):format(flagCount, reset and ", character reset" or "")
+	table.insert(results, { name = name, detected = detected, note = note })
+	log(("%s -> %s (%s)"):format(name, detected and "CAUGHT" or "MISSED", note))
+	if reset then
+		player.CharacterAdded:Wait()
+	end
+end
+
+-- Horizontal CFrame movement above WalkSpeed but under the server's studs/sec cap, with jitter
+-- and short stops like a person changing direction.
+tests.human_speed = function()
+	local dir = Vector3.new(1, 0, 0)
+	local pauseUntil = 0
+	local speed = CONFIG.HumanSpeed
+	runMoveTest("Humanized speed (CFrame, under cap)", CONFIG.HumanDuration, function(root, dt, t)
+		if t < pauseUntil then
+			return
+		end
+		if moveRng:NextNumber() < 0.01 then
+			pauseUntil = t + 0.2 + moveRng:NextNumber() * 0.6
+			dir = CFrame.Angles(0, math.rad(moveRng:NextNumber(-70, 70)), 0):VectorToWorldSpace(dir)
+			return
+		end
+		local s = speed * (1 + moveRng:NextNumber(-0.1, 0.1))
+		root.CFrame += dir * s * dt
+	end)
+end
+
+-- Short hops that each stay under MaxTeleport and whose average stays near the speed cap.
+tests.human_hops = function()
+	local acc = 0
+	runMoveTest("Humanized short-hop teleport", CONFIG.HumanDuration, function(root, dt)
+		acc += dt
+		if acc >= 0.15 then
+			acc = 0
+			root.CFrame += Vector3.new(CONFIG.HopStuds * (0.8 + moveRng:NextNumber() * 0.4), 0, 0)
+		end
+	end)
+end
+
+-- Slow rise in bursts, reaching only part of the allowed air-rise before settling.
+tests.human_fly = function()
+	local startY = 0
+	local first = true
+	runMoveTest("Humanized fly (slow burst rise)", CONFIG.HumanDuration, function(root, dt, t)
+		if first then
+			startY = root.Position.Y
+			first = false
+		end
+		local burst = math.sin(t * 1.3) > 0
+		if burst and root.Position.Y - startY < CONFIG.HumanRiseMax then
+			root.CFrame += Vector3.new(0, CONFIG.HumanRiseRate * dt, 0)
+			root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z)
+		end
+	end)
+end
+
 tests.remotes = function()
 	if #CONFIG.RemoteNames == 0 then
 		log("Remote fuzz skipped: add names to CONFIG.RemoteNames")
@@ -522,13 +599,16 @@ local function run(cmd: string)
 		for _, name in { "speed", "jump", "teleport", "fly", "noclip", "health" } do
 			tests[name]()
 		end
+		for _, name in { "human_speed", "human_hops", "human_fly" } do
+			tests[name]()
+		end
 		tests.remotes()
 		printReport()
 	elseif tests[cmd] then
 		tests[cmd]()
 		printReport()
 	else
-		log("Unknown test. Options: all, speed, jump, teleport, fly, noclip, health, remotes")
+		log("Unknown test. Options: all, speed, jump, teleport, fly, noclip, health, human_speed, human_hops, human_fly, remotes")
 	end
 end
 
@@ -548,7 +628,7 @@ else
 	player.Chatted:Connect(handle)
 end
 
-log("Ready. Type /ac all  (or speed, jump, teleport, fly, noclip, health, remotes)")
+log("Ready. Type /ac all  (or speed, jump, teleport, fly, noclip, health, human_speed, human_hops, human_fly, remotes)")
 
 if CONFIG.AutoRun then
 	task.spawn(run, "all")
@@ -2048,6 +2128,68 @@ barButton("Scan game", 0, function()
 end, 1)
 barButton("Run tests", 0.25, function()
 	task.spawn(runTests, "all")
+end, 1)
+
+-- ===== DETECTIONS PANEL (server flags from AntiCheatServer) =====
+local detFrame = Instance.new("Frame")
+detFrame.Size = UDim2.fromOffset(380, 300)
+detFrame.Position = UDim2.fromOffset(365, 60)
+detFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
+detFrame.Active = true
+detFrame.Draggable = true
+detFrame.Visible = false
+detFrame.Parent = gui
+
+local detTitle = Instance.new("TextLabel")
+detTitle.Size = UDim2.new(1, 0, 0, 28)
+detTitle.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
+detTitle.TextColor3 = Color3.new(1, 1, 1)
+detTitle.Font = Enum.Font.GothamBold
+detTitle.TextSize = 14
+detTitle.Text = "Detections (server flags)"
+detTitle.Parent = detFrame
+
+local detList = Instance.new("ScrollingFrame")
+detList.Position = UDim2.fromOffset(0, 28)
+detList.Size = UDim2.new(1, 0, 1, -28)
+detList.BackgroundTransparency = 1
+detList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+detList.CanvasSize = UDim2.new()
+detList.ScrollBarThickness = 5
+detList.Parent = detFrame
+local detLayout = Instance.new("UIListLayout")
+detLayout.Padding = UDim.new(0, 2)
+detLayout.SortOrder = Enum.SortOrder.LayoutOrder
+detLayout.Parent = detList
+
+local detCount = 0
+local function addDetection(who: string, reason: string, strikes: number, maxStrikes: number)
+	detCount += 1
+	local l = Instance.new("TextLabel")
+	l.LayoutOrder = -detCount -- newest on top
+	l.Size = UDim2.new(1, -8, 0, 20)
+	l.BackgroundColor3 = strikes >= maxStrikes and Color3.fromRGB(120, 40, 40) or Color3.fromRGB(38, 38, 48)
+	l.BorderSizePixel = 0
+	l.TextColor3 = Color3.fromRGB(230, 230, 230)
+	l.Font = Enum.Font.Code
+	l.TextSize = 12
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Text = ("%s  %s  %s (%d/%d)"):format(os.date("%H:%M:%S"), who, reason, strikes, maxStrikes)
+	l.Parent = detList
+	print(("[ACDetect] %s: %s (%d/%d)"):format(who, reason, strikes, maxStrikes))
+end
+
+task.spawn(function()
+	local flags = ReplicatedStorage:WaitForChild("ACFlags", 15)
+	if flags and flags:IsA("RemoteEvent") then
+		flags.OnClientEvent:Connect(addDetection)
+	else
+		detTitle.Text = "Detections: server script not found"
+	end
+end)
+
+barButton("Detections", 0.5, function()
+	detFrame.Visible = not detFrame.Visible
 end, 1)
 
 task.spawn(function()
