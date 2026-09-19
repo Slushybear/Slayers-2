@@ -15,6 +15,81 @@ local TextChatService = game:GetService("TextChatService")
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
 
+-- Teardown registry. Declared unconditionally and BEFORE the gate below, because the rest of the
+-- file uses it: if the gate block gets removed, the file must still load rather than dying with
+-- "invalid argument #1 to 'insert' (table expected, got nil)".
+local teardown: { () -> () } = {}
+local revoked = false
+local function revokeAll(reason: string)
+	if revoked then
+		return
+	end
+	revoked = true
+	warn("[AC] " .. reason .. " - shutting down.")
+	for _, fn in teardown do
+		pcall(fn)
+	end
+end
+
+-- ===== TEST-MODE GATE =====
+-- Layered, most trustworthy first:
+--   1. Studio                              -> allowed
+--   2. ACTestBridge published true          -> allowed (full harness: flags report, tests score)
+--   3. ACTestBridge published false         -> refused (an explicit server "no" always wins)
+--   4. No bridge installed, but you are     -> allowed, degraded: nothing publishes ACFlags, so
+--      this game's creator                     every test will read MISSED until you add it
+--   5. Anything else                        -> refused
+local OWNED_GROUP_IDS: { number } = {} -- add your group IDs if the place is group-owned
+
+local function ownsThisGame(): boolean
+	if game.CreatorType == Enum.CreatorType.User then
+		return game.CreatorId == player.UserId
+	end
+	return table.find(OWNED_GROUP_IDS, game.CreatorId) ~= nil
+end
+
+local AC_ENABLED, AC_DEGRADED = false, false
+do
+	-- short wait: the bridge sets this on server start, so it is normally there already
+	local deadline = os.clock() + 5
+	while ReplicatedStorage:GetAttribute("ACTestMode") == nil and os.clock() < deadline do
+		task.wait(0.25)
+	end
+	local published = ReplicatedStorage:GetAttribute("ACTestMode")
+	local why
+	if RunService:IsStudio() then
+		AC_ENABLED, why = true, "Studio"
+	elseif published == true then
+		AC_ENABLED, why = true, "server enabled test mode"
+	elseif published == false then
+		AC_ENABLED, why = false, "server has test mode disabled (not your private server)"
+	elseif ownsThisGame() then
+		AC_ENABLED, AC_DEGRADED, why = true, true, "you are this game's creator"
+	else
+		AC_ENABLED, why = false, "not your game, and no server opt-in"
+	end
+
+	if not AC_ENABLED then
+		warn(("[AC] Refusing to run: %s."):format(why))
+		warn(("[AC] PlaceId=%d  creator=%s %d  you=%d")
+			:format(game.PlaceId, tostring(game.CreatorType), game.CreatorId, player.UserId))
+		return
+	end
+	print(("[AC] Test mode: %s"):format(why))
+	if AC_DEGRADED then
+		warn("[AC] ACTestBridge.server.lua is not installed, so nothing publishes ACFlags.")
+		warn("[AC] The menu and automation work, but every test will report MISSED until you")
+		warn("[AC] add ACTestBridge to ServerScriptService and call Bridge.report from your anti-cheat.")
+	end
+end
+
+-- The server can revoke at any time (e.g. the private-server owner leaves).
+ReplicatedStorage:GetAttributeChangedSignal("ACTestMode"):Connect(function()
+	if ReplicatedStorage:GetAttribute("ACTestMode") == false then
+		revokeAll("Server revoked test mode")
+	end
+end)
+
 -- ===== SELF-IDENTIFICATION (so the scanner doesn't report this tool as game data) =====
 -- The getgc scan walks every live object, which includes this script's own tables and closures.
 -- Without this, the report lists our settings table as "quest data" and our own field names
@@ -942,22 +1017,7 @@ end
 end
 
 -- ===== SCANNER (collects info about your game) =====
-local scannerRan = false
-local function runScanner()
-	if scannerRan then
-		warn("[ACScan] already ran this session; re-execute the script to scan again")
-		return
-	end
-	scannerRan = true
-	local RECORD_SECONDS = 60
--- ===== helpers =====
-local lines: { string } = {}
--- Structured copy of the findings, saved as ACScanData.json for AntiCheatMenu to load.
-local data = { remotes = {}, enemies = {}, gcRemotes = {}, candidates = {}, questStrings = {}, recorded = {} }
-local function add(s: string)
-	table.insert(lines, s)
-end
-
+-- Value serialiser, shared by the scanner report and the remote recorder.
 local function ser(v: any, depth: number?): string
 	depth = depth or 0
 	local t = typeof(v)
@@ -984,6 +1044,217 @@ local function ser(v: any, depth: number?): string
 		return tostring(v)
 	end
 	return tostring(v) .. "(" .. t .. ")"
+end
+
+-- ===== REMOTE RECORDER =====
+-- Captures the remote calls YOUR OWN actions produce, so their argument format can be replayed.
+--
+-- This is a toggle with no time limit, not a fixed window. A quest cycle (walk out, accept, do
+-- the objective, walk back, hand in) does not fit in 60 seconds, and you may only be able to do
+-- one quest now and another later. Captures accumulate across start/stop and across sessions, so
+-- you can record the accept today and the turn-in whenever you get to it.
+--
+-- Calls are grouped per remote AND per "selector" (the first string argument), because games
+-- commonly multiplex everything through one remote - here SignalEvent.Event("Combat_Service",...).
+type Variant = { count: number, sample: string, alt: string? }
+type Logged = { count: number, variants: { [string]: Variant } }
+
+local RECORD_FILE = "ACRecorded.json"
+local MAX_VARIANTS = 24
+
+local Recorder = claim({
+	on = false,
+	installed = false,
+	total = 0,
+	captures = {} :: { [string]: Logged },
+	onChange = nil :: (() -> ())?,
+})
+
+local function variantCount(entry: Logged): number
+	local n = 0
+	for _ in entry.variants do
+		n += 1
+	end
+	return n
+end
+
+local function recordCall(self: any, ...)
+	local args = table.pack(...)
+	local parts = {}
+	for i = 1, args.n do
+		table.insert(parts, ser(args[i]))
+	end
+	local key = self:GetFullName()
+	local sig = key .. "(" .. table.concat(parts, ", ") .. ")"
+	local selector = "(no selector)"
+	if args.n > 0 then
+		selector = type(args[1]) == "string" and args[1] or ("<" .. typeof(args[1]) .. ">")
+	end
+	Recorder.total += 1
+	local entry = Recorder.captures[key]
+	if not entry then
+		entry = { count = 0, variants = {} }
+		Recorder.captures[key] = entry
+	end
+	entry.count += 1
+	local v = entry.variants[selector]
+	if v then
+		v.count += 1
+		if v.sample ~= sig and not v.alt then
+			v.alt = sig -- one differing sample shows which arguments vary
+		end
+	elseif variantCount(entry) < MAX_VARIANTS then
+		entry.variants[selector] = { count = 1, sample = sig }
+	end
+	if Recorder.onChange then
+		Recorder.onChange()
+	end
+end
+
+-- Hooks are installed once and left in place; they only log while Recorder.on is true.
+function Recorder.install(): string
+	if Recorder.installed then
+		return "already installed"
+	end
+	if not (env.hookmetamethod and env.getnamecallmethod) then
+		return "unavailable (this executor has no hookmetamethod)"
+	end
+	Recorder.installed = true
+	local wrap = env.newcclosure or function(f)
+		return f
+	end
+	-- method-style calls: remote:FireServer(...)
+	local oldNamecall
+	oldNamecall = env.hookmetamethod(game, "__namecall", wrap(function(self, ...)
+		local method = env.getnamecallmethod()
+		if Recorder.on and (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
+			pcall(recordCall, self, ...)
+		end
+		return oldNamecall(self, ...)
+	end))
+	-- cached/dot-style calls never touch __namecall, so hook the functions too where possible
+	local extra: { string } = {}
+	if env.hookfunction then
+		for _, spec in { { "RemoteEvent", "FireServer" }, { "RemoteFunction", "InvokeServer" },
+			{ "UnreliableRemoteEvent", "FireServer" } } do
+			local ok = pcall(function()
+				local probe = Instance.new(spec[1])
+				local orig
+				orig = env.hookfunction(probe[spec[2]], wrap(function(self, ...)
+					if Recorder.on and typeof(self) == "Instance" then
+						pcall(recordCall, self, ...)
+					end
+					return orig(self, ...)
+				end))
+				probe:Destroy()
+			end)
+			if ok then
+				table.insert(extra, spec[1])
+			end
+		end
+	end
+	return #extra > 0 and ("__namecall + " .. table.concat(extra, ", ")) or "__namecall only"
+end
+
+function Recorder.save()
+	if not env.writefile then
+		return
+	end
+	pcall(function()
+		env.writefile(RECORD_FILE, HttpService:JSONEncode(Recorder.captures))
+	end)
+end
+
+function Recorder.load()
+	if not (env.isfile and env.readfile and env.isfile(RECORD_FILE)) then
+		return
+	end
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(env.readfile(RECORD_FILE))
+	end)
+	if not (ok and type(data) == "table") then
+		return
+	end
+	-- merge, so a capture from an earlier session is not lost by this one
+	for key, entry in data do
+		if type(entry) == "table" and type(entry.variants) == "table" then
+			local cur = Recorder.captures[key]
+			if not cur then
+				Recorder.captures[key] = entry
+			else
+				for sel, v in entry.variants do
+					if not cur.variants[sel] and variantCount(cur) < MAX_VARIANTS then
+						cur.variants[sel] = v
+					end
+				end
+			end
+		end
+	end
+end
+
+function Recorder.setOn(state: boolean): string
+	if state and not Recorder.installed then
+		local how = Recorder.install()
+		if not Recorder.installed then
+			return how
+		end
+		print("[ACRec] hooks: " .. how)
+	end
+	Recorder.on = state
+	if not state then
+		Recorder.save()
+	end
+	if Recorder.onChange then
+		Recorder.onChange()
+	end
+	return state and "recording" or "stopped"
+end
+
+-- Human-readable dump, busiest selector first.
+function Recorder.report(): string
+	local out = { "=== Recorded remote calls ===",
+		"Grouped by first argument (the action selector for multiplexed remotes)." }
+	local any = false
+	for name, entry in Recorder.captures do
+		any = true
+		table.insert(out, ("%s  x%d"):format(name, entry.count))
+		local sels = {}
+		for sel in entry.variants do
+			table.insert(sels, sel)
+		end
+		table.sort(sels, function(a, b)
+			return entry.variants[a].count > entry.variants[b].count
+		end)
+		for _, sel in sels do
+			local v = entry.variants[sel]
+			table.insert(out, ("    [%s] x%d"):format(sel, v.count))
+			table.insert(out, ("        %s"):format(v.sample))
+			if v.alt then
+				table.insert(out, ("        alt: %s"):format(v.alt))
+			end
+		end
+	end
+	if not any then
+		table.insert(out, "(nothing captured yet)")
+	end
+	return table.concat(out, "\n")
+end
+
+Recorder.load()
+
+local scannerRan = false
+local function runScanner()
+	if scannerRan then
+		warn("[ACScan] already ran this session; re-execute the script to scan again")
+		return
+	end
+	scannerRan = true
+-- ===== helpers =====
+local lines: { string } = {}
+-- Structured copy of the findings, saved as ACScanData.json for AntiCheatMenu to load.
+local data = { remotes = {}, enemies = {}, gcRemotes = {}, candidates = {}, questStrings = {}, recorded = {} }
+local function add(s: string)
+	table.insert(lines, s)
 end
 
 local function flush(label: string)
@@ -1300,141 +1571,13 @@ for _, fn in { "hookmetamethod", "getnamecallmethod", "newcclosure", "writefile"
 end
 add("")
 gcScan()
-flush("Phase 1")
-applyScanData()
-
--- ===== Phase 2: record your manual remote calls =====
-if not (env.hookmetamethod and env.getnamecallmethod) then
-	warn("[ACScan] hookmetamethod unavailable here, skipping record phase. Phase 1 report is complete.")
-	return
-end
-
-local recording = true
--- Calls are grouped per remote AND per "selector" - the first string argument. Games commonly
--- multiplex everything through one remote (here: SignalEvent.Event("Combat_Service", ...)), so
--- keeping a single sample per remote threw away every distinct action but one. Each selector is
--- now tracked separately, which is what makes the quest / skill / sell calls visible at all.
-type Variant = { count: number, sample: string, alt: string? }
-type Logged = { count: number, variants: { [string]: Variant } }
-local logged: { [string]: Logged } = {}
-local MAX_VARIANTS = 24
-
-local function nextVariantSlot(entry: Logged): boolean
-	local n = 0
-	for _ in entry.variants do
-		n += 1
-	end
-	return n < MAX_VARIANTS
-end
-
-local totalCalls = 0
-local function logCall(self: any, ...)
-	local args = table.pack(...)
-	local parts = {}
-	for i = 1, args.n do
-		table.insert(parts, ser(args[i]))
-	end
-	local key = self:GetFullName()
-	local sig = key .. "(" .. table.concat(parts, ", ") .. ")"
-	-- selector: first string arg, else first arg's type, else none
-	local selector = "(no selector)"
-	if args.n > 0 then
-		if type(args[1]) == "string" then
-			selector = args[1]
-		else
-			selector = "<" .. typeof(args[1]) .. ">"
-		end
-	end
-	totalCalls += 1
-	local entry = logged[key]
-	if not entry then
-		entry = { count = 0, variants = {} }
-		logged[key] = entry
-	end
-	entry.count += 1
-	local v = entry.variants[selector]
-	if v then
-		v.count += 1
-		if v.sample ~= sig and not v.alt then
-			v.alt = sig -- one differing sample per selector shows which args vary
-		end
-	elseif nextVariantSlot(entry) then
-		entry.variants[selector] = { count = 1, sample = sig }
-	end
-end
-
-local wrap = env.newcclosure or function(f) return f end
-
--- Hook 1: method-style calls (remote:FireServer(...)) go through __namecall.
-local oldNamecall
-oldNamecall = env.hookmetamethod(game, "__namecall", wrap(function(self, ...)
-	local method = env.getnamecallmethod()
-	if recording and (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
-		pcall(logCall, self, ...)
-	end
-	return oldNamecall(self, ...)
-end))
-
--- Hook 2: code that caches the function or calls remote.FireServer(remote, ...) never touches __namecall,
--- so also hook the functions themselves when the executor supports it.
-local hookedFns: { string } = {}
-if env.hookfunction then
-	for _, spec in { { "RemoteEvent", "FireServer" }, { "RemoteFunction", "InvokeServer" }, { "UnreliableRemoteEvent", "FireServer" } } do
-		local ok = pcall(function()
-			local probe = Instance.new(spec[1])
-			local orig
-			orig = env.hookfunction(probe[spec[2]], wrap(function(self, ...)
-				if recording and typeof(self) == "Instance" then
-					pcall(logCall, self, ...)
-				end
-				return orig(self, ...)
-			end))
-			probe:Destroy()
-		end)
-		if ok then
-			table.insert(hookedFns, spec[1] .. "." .. spec[2])
-		end
-	end
-end
-print(("[ACScan] hooks: __namecall%s"):format(#hookedFns > 0 and (" + " .. table.concat(hookedFns, ", ")) or (env.hookfunction and " (hookfunction failed)" or " only (no hookfunction in this executor)")))
-
-print(("[ACScan] RECORDING for %d seconds. Now do these BY HAND in your game: attack, use skills, parry, accept and complete a quest, spend a stat point, sell an item, pick up loot."):format(RECORD_SECONDS))
--- progress every 10s so you can tell whether the hook is seeing anything
-for elapsed = 10, RECORD_SECONDS, 10 do
-	task.wait(10)
-	print(("[ACScan] %ds left, %d remote call(s) seen so far"):format(RECORD_SECONDS - elapsed, totalCalls))
-end
-recording = false
-
-add("--- Recorded outgoing remote calls (what YOU triggered manually) ---")
-add("Grouped by first argument, which for multiplexed remotes is the action selector.")
-local any = false
-for name, entry in logged do
-	any = true
-	add(("%s  x%d"):format(name, entry.count))
-	-- busiest selectors first: the action you repeated most is usually the one you were after
-	local sels = {}
-	for sel in entry.variants do
-		table.insert(sels, sel)
-	end
-	table.sort(sels, function(a, b)
-		return entry.variants[a].count > entry.variants[b].count
-	end)
-	for _, sel in sels do
-		local v = entry.variants[sel]
-		add(("    [%s] x%d\n        %s"):format(sel, v.count, v.sample))
-		if v.alt then
-			add(("        alt: %s"):format(v.alt))
-		end
-		data.recorded[name .. "|" .. sel] = { count = v.count, sample = v.sample }
-	end
-end
-if not any then
-	add("(nothing recorded, hook may not have fired)")
-end
-add("")
 flush("Full report")
 applyScanData()
+
+-- Recording your own remote calls used to happen here as a fixed 60-second window. It is now a
+-- toggle on the Remotes tab instead: a quest cycle does not fit in 60 seconds, and captures
+-- need to accumulate across sessions.
+print("[ACScan] Scan done. To capture remote argument formats, use Remotes > Record remote calls.")
 
 end
 
@@ -3229,6 +3372,75 @@ local function buildMenu()
 
 	-- Remotes tab
 	local remList = scroller(pRem, UDim2.new(), UDim2.new(1, 0, 1, 0))
+
+	-- ---- recorder: capture the argument format of calls YOUR actions produce ----
+	textRow(remList, 62, "Record remote calls: turn it on, then do the thing by hand (accept a quest, "
+		.. "hand one in, sell something). No time limit - leave it on across a whole quest. Captures "
+		.. "accumulate across sessions, so the accept and the turn-in can be recorded days apart.", C.dim)
+	local recBtn = mk("TextButton", {
+		Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.accent, BorderSizePixel = 0,
+		Text = "Start recording", TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13,
+	}, remList)
+	local recStatus = textRow(remList, 20, "not recording", C.dim)
+	local recList = textRow(remList, 150, "(nothing captured yet)")
+	recList.Font = Enum.Font.Code
+	recList.TextSize = 11
+	recList.TextYAlignment = Enum.TextYAlignment.Top
+
+	local function refreshRecorder()
+		recBtn.Text = Recorder.on and "Stop recording" or "Start recording"
+		recBtn.BackgroundColor3 = Recorder.on and Color3.fromRGB(150, 60, 60) or C.accent
+		recStatus.Text = ("%s  -  %d call(s) seen this session"):format(
+			Recorder.on and "RECORDING" or "not recording", Recorder.total)
+		recStatus.TextColor3 = Recorder.on and C.warn or C.dim
+		-- compact live view: one line per selector, busiest first
+		local rows = {}
+		for name, entry in Recorder.captures do
+			local short = name:match("[^%.]+$") or name
+			local sels = {}
+			for sel in entry.variants do
+				table.insert(sels, sel)
+			end
+			table.sort(sels, function(a, b)
+				return entry.variants[a].count > entry.variants[b].count
+			end)
+			for _, sel in sels do
+				table.insert(rows, ("%-22s %-26s x%d"):format(short, sel, entry.variants[sel].count))
+			end
+		end
+		table.sort(rows)
+		recList.Text = #rows > 0 and table.concat(rows, "\n") or "(nothing captured yet)"
+	end
+	Recorder.onChange = refreshRecorder
+
+	recBtn.MouseButton1Click:Connect(function()
+		local msg = Recorder.setOn(not Recorder.on)
+		if msg ~= "recording" and msg ~= "stopped" then
+			recStatus.Text = msg -- e.g. executor has no hookmetamethod
+			recStatus.TextColor3 = C.bad
+		end
+	end)
+
+	actionRow(remList, {
+		{ "Print / copy captures", function()
+			local text = Recorder.report()
+			print(text)
+			if env.setclipboard then
+				pcall(env.setclipboard, text)
+			end
+			Recorder.save()
+			recStatus.Text = "captures printed to output" .. (env.setclipboard and " and copied" or "")
+		end },
+		{ "Clear captures", function()
+			table.clear(Recorder.captures)
+			Recorder.total = 0
+			Recorder.save()
+			refreshRecorder()
+		end },
+	})
+	refreshRecorder()
+
+	-- ---- fuzzer ----
 	textRow(remList, 34, "Remote names to fuzz (comma-separated, RemoteEvents under ReplicatedStorage). Sends odd payloads and a 500-call spam.", C.dim)
 	local remBox = mk("TextBox", {
 		Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = C.field, ClearTextOnFocus = false, PlaceholderText = "RemoteA, RemoteB",
