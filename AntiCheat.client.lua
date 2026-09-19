@@ -38,17 +38,24 @@ end
 --   4. no bridge, and you own this game          -> allowed, degraded (tests can't score)
 --      (or your account is in ALLOWED_USER_IDS - e.g. an alt you test with)
 --   5. anything else                            -> refused
-local OWNED_GROUP_IDS: { number } = {}  -- group IDs, if the place is group-owned
-local ALLOWED_USER_IDS: { 6068872442 } = {6068872442} -- alt accounts you test your own game with
+local OWNER_USER_ID = 4622985887            -- your main account (the game's creator)
+local OWNED_GROUP_IDS: { number } = {}     -- group IDs, if the place is group-owned
+local ALLOWED_USER_IDS: { number } = {     -- alt accounts you test your own game with
+	6068872442,
+}
 
+-- Two separate questions, both must be yes:
+--   is this place yours?          (created by OWNER_USER_ID or one of your groups)
+--   is this account one of yours? (the owner, or a listed alt)
+-- The alt list only ever applies to YOUR places. Checking the account alone would let a listed
+-- alt run this on any game at all.
 local function ownsThisGame(): boolean
-	if table.find(ALLOWED_USER_IDS, player.UserId) then
-		return true
+	local placeIsYours = (game.CreatorType == Enum.CreatorType.User and game.CreatorId == OWNER_USER_ID)
+		or (game.CreatorType == Enum.CreatorType.Group and table.find(OWNED_GROUP_IDS, game.CreatorId) ~= nil)
+	if not placeIsYours then
+		return false
 	end
-	if game.CreatorType == Enum.CreatorType.User then
-		return game.CreatorId == player.UserId
-	end
-	return table.find(OWNED_GROUP_IDS, game.CreatorId) ~= nil
+	return player.UserId == OWNER_USER_ID or table.find(ALLOWED_USER_IDS, player.UserId) ~= nil
 end
 
 local AC_ENABLED, AC_DEGRADED = false, false
