@@ -332,7 +332,17 @@ local CONFIG = {
 	-- true = run every test as soon as the script executes (handy from an executor)
 	AutoRun = false,
 	-- Remotes to fuzz. Add names of RemoteEvents in ReplicatedStorage.
-	RemoteNames = {} :: { string },
+	-- Full paths under ReplicatedStorage, from your scan (purchasedGamepass left out on purpose).
+	RemoteNames = {
+		"Communication.ServerAndClient.Signals.SignalFunction.Function",
+		"Communication.ServerAndClient.Signals.SignalEvent.Event",
+		"Communication.ServerAndClient.Signals.PartyHud.Event",
+		"Communication.ServerAndClient.Effects.EffectsEvent.Event",
+		"CAM.Global.ServerClientPortal.Event",
+		"CAM.Global.ServerClientPortal.Function",
+		"OCIServerHolder.Remote",
+		"OCIServerHolder.RemoteFunction",
+	} :: { string },
 	-- How long to wait after each test for the server to react (seconds).
 	ReactWindow = 4,
 	SpeedValue = 100,
@@ -345,9 +355,27 @@ local CONFIG = {
 	HopStuds = 4,        -- studs per hop, one hop per 0.15s (~27 studs/sec)
 	HumanRiseMax = 9,    -- studs; server MaxAirRise is 12
 	HumanRiseRate = 4,   -- studs/sec while a burst is active
+	-- Automation-signature tests: identical, perfectly regular behaviour repeated until flagged
+	AutoAttempts = 200,  -- give up after this many attempts with no flag
+	AutoInterval = 0.5,  -- seconds between remote calls (exact, no jitter)
+	PatrolStuds = 30,    -- one lap = out and back this far
+	PatrolSpeed = 16,    -- studs/sec, kept at a legal walk speed so only the pattern is unusual
+	AutoRemote = "",     -- full path under ReplicatedStorage of the remote to call at a fixed interval
+	AutoRemoteArgs = {} :: { any },
 }
 
-local results: { { name: string, detected: boolean, note: string } } = {}
+local results: { { key: string, name: string, detected: boolean, note: string } } = {}
+local currentKey = ""
+local listeners = { onStart = {} :: { (string) -> () }, onResult = {} :: { (any) -> () } }
+local busy = false
+
+local function record(name: string, detected: boolean, note: string)
+	local entry = { key = currentKey, name = name, detected = detected, note = note }
+	table.insert(results, entry)
+	for _, fn in listeners.onResult do
+		task.spawn(fn, entry)
+	end
+end
 
 local function log(msg: string)
 	print(("[ACTest] %s"):format(msg))
@@ -383,7 +411,7 @@ local function runTest(name: string, action: (Humanoid, BasePart) -> (), wasReve
 		note = detected and "value reverted / corrected" or "NOT DETECTED"
 	end
 
-	table.insert(results, { name = name, detected = detected, note = note })
+	record(name, detected, note)
 	log(("%s -> %s (%s)"):format(name, detected and "CAUGHT" or "MISSED", note))
 	if not detected then
 		-- put things back so the next test starts clean
@@ -499,7 +527,7 @@ local function runMoveTest(name: string, duration: number, step: (root: BasePart
 	local reset = player.Character ~= startChar or hum.Health <= 0
 	local detected = flagCount > 0 or reset
 	local note = ("%d flag(s)%s"):format(flagCount, reset and ", character reset" or "")
-	table.insert(results, { name = name, detected = detected, note = note })
+	record(name, detected, note)
 	log(("%s -> %s (%s)"):format(name, detected and "CAUGHT" or "MISSED", note))
 	if reset then
 		player.CharacterAdded:Wait()
@@ -555,6 +583,92 @@ tests.human_fly = function()
 	end)
 end
 
+-- ===== AUTOMATION-SIGNATURE TESTS =====
+-- Real automation is recognisable by repetition and zero variance, not by any single value being
+-- illegal. Each attempt is identical to the last; the run stops at the first server flag and
+-- reports how many attempts it took, so you can see how far your flag threshold sits.
+-- These are not in "all" (200 attempts can take minutes); run them by name or from the menu.
+local function resolveRemote(path: string): Instance?
+	local cur: Instance? = ReplicatedStorage
+	for part in path:gmatch("[^%.]+") do
+		cur = cur and cur:FindFirstChild(part)
+	end
+	return cur or ReplicatedStorage:FindFirstChild(path, true)
+end
+
+local function sendRemote(remote: Instance, ...: any)
+	if remote:IsA("RemoteEvent") then
+		(remote :: RemoteEvent):FireServer(...)
+	else
+		task.spawn(pcall, function(...)
+			(remote :: RemoteFunction):InvokeServer(...) -- may yield/never return; runs detached
+		end, ...)
+	end
+end
+
+local function runRepeatTest(name: string, attempt: (n: number) -> ())
+	local char, hum = getChar()
+	log("Running: " .. name)
+	flagCount = 0
+	local firstAt: number? = nil
+	local n = 0
+	while n < CONFIG.AutoAttempts and player.Character == char and hum.Health > 0 and not firstAt do
+		n += 1
+		attempt(n)
+		if flagCount > 0 then
+			firstAt = n
+		end
+	end
+	task.wait(CONFIG.ReactWindow) -- the server checks on an interval, so allow late flags
+	local reset = player.Character ~= char or hum.Health <= 0
+	if not firstAt and flagCount > 0 then
+		firstAt = n
+	end
+	local detected = firstAt ~= nil or reset
+	local note = firstAt and ("first flag after %d attempt(s), %d flag(s) total"):format(firstAt, flagCount)
+		or ("no flag after %d attempts"):format(n)
+	record(name, detected, note .. (reset and ", character reset" or ""))
+	log(("%s -> %s (%s)"):format(name, detected and "CAUGHT" or "MISSED", note))
+	if reset then
+		player.CharacterAdded:Wait()
+	end
+end
+
+-- Constant-speed A->B->A patrol on the exact same line every lap.
+tests.auto_path = function()
+	local _, _, root0 = getChar()
+	local a = root0.Position
+	local b = a + Vector3.new(CONFIG.PatrolStuds, 0, 0)
+	local function glide(root: BasePart, from: Vector3, to: Vector3)
+		local dur = (to - from).Magnitude / CONFIG.PatrolSpeed
+		local t = 0
+		local rot = root.CFrame - root.CFrame.Position
+		while t < dur do
+			t += RunService.Heartbeat:Wait()
+			root.CFrame = CFrame.new(from:Lerp(to, math.min(t / dur, 1))) * rot
+		end
+	end
+	runRepeatTest("Automation: identical patrol lap", function()
+		glide(root0, a, b)
+		glide(root0, b, a)
+	end)
+end
+
+-- One remote fired at an exact fixed interval with identical arguments.
+tests.auto_remote = function()
+	local remote = CONFIG.AutoRemote ~= "" and resolveRemote(CONFIG.AutoRemote) or nil
+	if not (remote and (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction"))) then
+		log("auto_remote skipped: set CONFIG.AutoRemote to a full remote path (Automation tab)")
+		return
+	end
+	local nextAt = os.clock()
+	runRepeatTest("Automation: fixed-interval remote", function()
+		sendRemote(remote, table.unpack(CONFIG.AutoRemoteArgs))
+		nextAt += CONFIG.AutoInterval
+		task.wait(math.max(0, nextAt - os.clock()))
+	end)
+end
+
 tests.remotes = function()
 	if #CONFIG.RemoteNames == 0 then
 		log("Remote fuzz skipped: add names to CONFIG.RemoteNames")
@@ -564,25 +678,26 @@ tests.remotes = function()
 		nil, 0, -1, math.huge, -math.huge, 0 / 0, 1e308, "", string.rep("A", 100000),
 		{}, { {} }, true, Vector3.new(math.huge, 0, 0), workspace, player,
 	}
+	-- Names are full paths under ReplicatedStorage ("A.B.C", as the scan prints them) or bare names.
 	for _, remoteName in CONFIG.RemoteNames do
-		local remote = ReplicatedStorage:FindFirstChild(remoteName, true)
-		if remote and remote:IsA("RemoteEvent") then
+		local remote = resolveRemote(remoteName)
+		if remote and (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction")) then
+			flagCount = 0
 			log("Fuzzing remote: " .. remoteName)
 			for i = 1, 15 do
-				pcall(function()
-					(remote :: RemoteEvent):FireServer(payloads[i])
-				end)
+				pcall(sendRemote, remote, payloads[i])
 			end
-			log("Spamming remote: " .. remoteName)
-			for _ = 1, 500 do
-				pcall(function()
-					(remote :: RemoteEvent):FireServer()
-				end)
+			if remote:IsA("RemoteEvent") then
+				log("Spamming remote: " .. remoteName)
+				for _ = 1, 500 do
+					pcall(sendRemote, remote)
+				end
 			end
-			task.wait(1)
-			log("Remote done (check server output for errors / rate-limit hits): " .. remoteName)
+			task.wait(CONFIG.ReactWindow)
+			-- Only remotes wrapped in AC.guard can flag; MISSED means no rate limit fired, not necessarily exploitable.
+			record("Remote " .. remoteName:match("[^%.]+$"), flagCount > 0, ("%d flag(s)"):format(flagCount))
 		else
-			log("Remote not found or not a RemoteEvent: " .. remoteName)
+			log("Remote not found or not a Remote: " .. remoteName)
 		end
 	end
 end
@@ -594,21 +709,35 @@ local function printReport()
 	end
 end
 
+local function invoke(key: string)
+	currentKey = key
+	for _, fn in listeners.onStart do
+		task.spawn(fn, key)
+	end
+	tests[key]()
+	currentKey = ""
+end
+
 local function run(cmd: string)
+	if busy then
+		log("A run is already in progress")
+		return
+	end
+	busy = true
 	if cmd == "all" then
-		for _, name in { "speed", "jump", "teleport", "fly", "noclip", "health" } do
-			tests[name]()
+		for _, name in { "speed", "jump", "teleport", "fly", "noclip", "health", "human_speed", "human_hops", "human_fly", "remotes" } do
+			invoke(name)
 		end
-		for _, name in { "human_speed", "human_hops", "human_fly" } do
-			tests[name]()
-		end
-		tests.remotes()
 		printReport()
 	elseif tests[cmd] then
-		tests[cmd]()
+		invoke(cmd)
 		printReport()
 	else
-		log("Unknown test. Options: all, speed, jump, teleport, fly, noclip, health, human_speed, human_hops, human_fly, remotes")
+		log("Unknown test. Options: all, speed, jump, teleport, fly, noclip, health, human_speed, human_hops, human_fly, auto_path, auto_remote, remotes")
+	end
+	busy = false
+	for _, fn in listeners.onStart do
+		task.spawn(fn, "")
 	end
 end
 
@@ -628,13 +757,14 @@ else
 	player.Chatted:Connect(handle)
 end
 
-log("Ready. Type /ac all  (or speed, jump, teleport, fly, noclip, health, human_speed, human_hops, human_fly, remotes)")
+log("Ready. Type /ac all  (or speed, jump, teleport, fly, noclip, health, human_speed, human_hops, human_fly, auto_path, auto_remote, remotes)")
 
 if CONFIG.AutoRun then
 	task.spawn(run, "all")
 end
 
-	return run
+	local api = { CONFIG = CONFIG, results = results, listeners = listeners, isBusy = function() return busy end }
+	return run, api
 end
 
 -- ===== SCANNER (collects info about your game) =====
@@ -1003,33 +1133,69 @@ end
 local recording = true
 local logged: { [string]: { count: number, sample: string } } = {}
 
+local totalCalls = 0
+local function logCall(self: any, ...)
+	local args = table.pack(...)
+	local parts = {}
+	for i = 1, args.n do
+		table.insert(parts, ser(args[i]))
+	end
+	local key = self:GetFullName()
+	local sig = key .. "(" .. table.concat(parts, ", ") .. ")"
+	totalCalls += 1
+	local entry = logged[key]
+	if not entry then
+		logged[key] = { count = 1, sample = sig }
+	else
+		entry.count += 1
+		-- keep up to one extra differing sample so argument variation is visible
+		if entry.sample ~= sig and not entry.sample:find("\n", 1, true) then
+			entry.sample ..= "\n      alt: " .. sig
+		end
+	end
+end
+
+local wrap = env.newcclosure or function(f) return f end
+
+-- Hook 1: method-style calls (remote:FireServer(...)) go through __namecall.
 local oldNamecall
-oldNamecall = env.hookmetamethod(game, "__namecall", (env.newcclosure or function(f) return f end)(function(self, ...)
+oldNamecall = env.hookmetamethod(game, "__namecall", wrap(function(self, ...)
 	local method = env.getnamecallmethod()
 	if recording and (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
-		local args = table.pack(...)
-		local parts = {}
-		for i = 1, args.n do
-			table.insert(parts, ser(args[i]))
-		end
-		local sig = self:GetFullName() .. "(" .. table.concat(parts, ", ") .. ")"
-		local key = self:GetFullName()
-		local entry = logged[key]
-		if not entry then
-			logged[key] = { count = 1, sample = sig }
-		else
-			entry.count += 1
-			-- keep up to one extra differing sample so argument variation is visible
-			if entry.sample ~= sig and not entry.sample:find("\n", 1, true) then
-				entry.sample ..= "\n      alt: " .. sig
-			end
-		end
+		pcall(logCall, self, ...)
 	end
 	return oldNamecall(self, ...)
 end))
 
+-- Hook 2: code that caches the function or calls remote.FireServer(remote, ...) never touches __namecall,
+-- so also hook the functions themselves when the executor supports it.
+local hookedFns: { string } = {}
+if env.hookfunction then
+	for _, spec in { { "RemoteEvent", "FireServer" }, { "RemoteFunction", "InvokeServer" }, { "UnreliableRemoteEvent", "FireServer" } } do
+		local ok = pcall(function()
+			local probe = Instance.new(spec[1])
+			local orig
+			orig = env.hookfunction(probe[spec[2]], wrap(function(self, ...)
+				if recording and typeof(self) == "Instance" then
+					pcall(logCall, self, ...)
+				end
+				return orig(self, ...)
+			end))
+			probe:Destroy()
+		end)
+		if ok then
+			table.insert(hookedFns, spec[1] .. "." .. spec[2])
+		end
+	end
+end
+print(("[ACScan] hooks: __namecall%s"):format(#hookedFns > 0 and (" + " .. table.concat(hookedFns, ", ")) or (env.hookfunction and " (hookfunction failed)" or " only (no hookfunction in this executor)")))
+
 print(("[ACScan] RECORDING for %d seconds. Now do these BY HAND in your game: attack, use skills, parry, accept and complete a quest, spend a stat point, sell an item, pick up loot."):format(RECORD_SECONDS))
-task.wait(RECORD_SECONDS)
+-- progress every 10s so you can tell whether the hook is seeing anything
+for elapsed = 10, RECORD_SECONDS, 10 do
+	task.wait(10)
+	print(("[ACScan] %ds left, %d remote call(s) seen so far"):format(RECORD_SECONDS - elapsed, totalCalls))
+end
 recording = false
 
 add("--- Recorded outgoing remote calls (what YOU triggered manually) ---")
@@ -1048,7 +1214,7 @@ applyScanData()
 
 end
 
-local runTests = setupTester()
+local runTests, testApi = setupTester()
 
 -- ===== SETTINGS (defaults) =====
 local S = {
@@ -1980,71 +2146,374 @@ local schema = {
 	{ "MaxMinutes", "Session limit (minutes)" }, { "MaxActions", "Session limit (actions)" },
 }
 
-local gui = Instance.new("ScreenGui")
-gui.Name = "ACMenu"
-gui.ResetOnSpawn = false
-gui.Parent = (env.gethui and env.gethui()) or player:WaitForChild("PlayerGui")
+local C = {
+	bg = Color3.fromRGB(24, 24, 30),
+	side = Color3.fromRGB(30, 30, 38),
+	bar = Color3.fromRGB(40, 40, 52),
+	row = Color3.fromRGB(38, 38, 48),
+	field = Color3.fromRGB(55, 55, 70),
+	accent = Color3.fromRGB(70, 60, 120),
+	text = Color3.fromRGB(230, 230, 230),
+	dim = Color3.fromRGB(150, 150, 165),
+	good = Color3.fromRGB(110, 255, 140),
+	bad = Color3.fromRGB(255, 110, 110),
+	warn = Color3.fromRGB(255, 210, 110),
+}
 
-local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(330, 460)
-frame.Position = UDim2.fromOffset(20, 60)
-frame.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
-frame.Active = true
-frame.Draggable = true
-frame.Parent = gui
+local function mk(class: string, props: { [string]: any }, parent: Instance?): any
+	local inst = Instance.new(class)
+	for k, v in props do
+		inst[k] = v
+	end
+	inst.Parent = parent
+	return inst
+end
 
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, 0, 0, 28)
-title.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
-title.TextColor3 = Color3.new(1, 1, 1)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 14
-title.Text = "Anti-cheat test menu (RightShift hides)"
-title.Parent = frame
+local function button(parent: Instance, text: string, pos: UDim2, size: UDim2, cb: () -> ()): TextButton
+	local b = mk("TextButton", {
+		Position = pos, Size = size, BackgroundColor3 = C.accent, BorderSizePixel = 0,
+		TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 12, Text = text,
+	}, parent)
+	b.MouseButton1Click:Connect(cb)
+	return b
+end
 
-local list = Instance.new("ScrollingFrame")
-list.Position = UDim2.fromOffset(0, 28)
-list.Size = UDim2.new(1, 0, 1, -118)
-list.BackgroundTransparency = 1
-list.CanvasSize = UDim2.new()
-list.AutomaticCanvasSize = Enum.AutomaticSize.Y
-list.ScrollBarThickness = 5
-list.Parent = frame
-local layout = Instance.new("UIListLayout")
-layout.Padding = UDim.new(0, 3)
-layout.Parent = list
+local function scroller(parent: Instance, pos: UDim2, size: UDim2): ScrollingFrame
+	local sf = mk("ScrollingFrame", {
+		Position = pos, Size = size, BackgroundTransparency = 1, BorderSizePixel = 0,
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 5,
+	}, parent)
+	mk("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder }, sf)
+	mk("UIPadding", {
+		PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 10), PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6),
+	}, sf)
+	return sf
+end
 
+local function textRow(parent: Instance, h: number, text: string, color: Color3?, order: number?): TextLabel
+	return mk("TextLabel", {
+		Size = UDim2.new(1, 0, 0, h), BackgroundColor3 = C.row, BorderSizePixel = 0, LayoutOrder = order or 0,
+		Text = text, TextColor3 = color or C.text, Font = Enum.Font.Gotham, TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true,
+	}, parent)
+end
+
+-- ===== window =====
+local gui = mk("ScreenGui", { Name = "ACMenu", ResetOnSpawn = false }, (env.gethui and env.gethui()) or player:WaitForChild("PlayerGui"))
+local frame = mk("Frame", {
+	Size = UDim2.fromOffset(640, 420), Position = UDim2.fromOffset(20, 60),
+	BackgroundColor3 = C.bg, BorderSizePixel = 0, Active = true, Draggable = true,
+}, gui)
+
+local header = mk("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.bar, BorderSizePixel = 0 }, frame)
+mk("TextLabel", {
+	Position = UDim2.fromOffset(10, 0), Size = UDim2.new(0.5, 0, 1, 0), BackgroundTransparency = 1,
+	Text = "AC Test Lab  (RightShift hides)", TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold,
+	TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
+}, header)
+mk("TextLabel", {
+	Position = UDim2.fromScale(0.5, 0), Size = UDim2.new(0.5, -10, 1, 0), BackgroundTransparency = 1,
+	Text = ("● Test mode: %s"):format(RunService:IsStudio() and "Studio" or "private server"),
+	TextColor3 = C.good, Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Right,
+}, header)
+
+local sidebar = mk("Frame", { Position = UDim2.fromOffset(0, 30), Size = UDim2.new(0, 130, 1, -54), BackgroundColor3 = C.side, BorderSizePixel = 0 }, frame)
+mk("UIListLayout", { Padding = UDim.new(0, 2) }, sidebar)
+mk("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6) }, sidebar)
+local content = mk("Frame", { Position = UDim2.fromOffset(130, 30), Size = UDim2.new(1, -130, 1, -54), BackgroundTransparency = 1 }, frame)
+
+local statusBar = mk("Frame", { Position = UDim2.new(0, 0, 1, -24), Size = UDim2.new(1, 0, 0, 24), BackgroundColor3 = C.bar, BorderSizePixel = 0 }, frame)
+local statusLbl = mk("TextLabel", {
+	Position = UDim2.fromOffset(10, 0), Size = UDim2.new(0.5, -10, 1, 0), BackgroundTransparency = 1,
+	Text = "Ready", TextColor3 = C.text, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+}, statusBar)
+local stats = mk("TextLabel", {
+	Position = UDim2.fromScale(0.5, 0), Size = UDim2.new(0.5, -10, 1, 0), BackgroundTransparency = 1,
+	TextColor3 = C.dim, Font = Enum.Font.Code, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd,
+}, statusBar)
+
+-- ===== tabs =====
+local pages: { [string]: Frame } = {}
+local tabButtons: { [string]: TextButton } = {}
+local function showTab(name: string)
+	for n, p in pages do
+		p.Visible = n == name
+		tabButtons[n].BackgroundColor3 = n == name and C.accent or C.side
+	end
+end
+local function addTab(name: string, text: string): Frame
+	local p = mk("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false }, content)
+	pages[name] = p
+	local b = mk("TextButton", {
+		Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.side, BorderSizePixel = 0, Text = text,
+		TextColor3 = C.text, Font = Enum.Font.Gotham, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
+	}, sidebar)
+	mk("UIPadding", { PaddingLeft = UDim.new(0, 8) }, b)
+	b.MouseButton1Click:Connect(function()
+		showTab(name)
+	end)
+	tabButtons[name] = b
+	return p
+end
+
+local pTests = addTab("Tests", "🧪 Tests")
+local pMove = addTab("Movement", "🏃 Movement")
+local pAuto = addTab("Automation", "🤖 Automation")
+local pDet = addTab("Detections", "🛰 Detections")
+local pRes = addTab("Results", "📊 Results")
+local pRem = addTab("Remotes", "🔌 Remotes")
+local pSet = addTab("Settings", "⚙ Settings")
+
+local function setStatus(text: string)
+	statusLbl.Text = text
+end
+
+-- ===== results / export =====
+local runCaught, runTotal, sessionFlags = 0, 0, 0
+local function updateSummary()
+	setStatus(("Last run: %d/%d caught • flags this session: %d"):format(runCaught, runTotal, sessionFlags))
+end
+
+local function exportResults()
+	local out = {}
+	for _, r in testApi.results do
+		table.insert(out, { test = r.key, name = r.name, detected = r.detected, note = r.note })
+	end
+	local json = HttpService:JSONEncode(out)
+	if env.writefile then
+		pcall(env.writefile, "ACResults.json", json)
+	end
+	if env.setclipboard then
+		pcall(env.setclipboard, json)
+	end
+	print("[ACTest] results JSON: " .. json)
+	setStatus(("Exported %d results (output%s%s)"):format(#out, env.writefile and ", ACResults.json" or "", env.setclipboard and ", clipboard" or ""))
+end
+
+local function actionRow(parent: Instance, defs: { { string | (() -> ()) } }, order: number?): Frame
+	local holder = mk("Frame", { Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1, LayoutOrder = order or 0 }, parent)
+	local n = #defs
+	for i, d in defs do
+		button(holder, d[1] :: string, UDim2.new((i - 1) / n, 2, 0, 0), UDim2.new(1 / n, -4, 1, 0), d[2] :: () -> ())
+	end
+	return holder
+end
+
+-- ===== test rows (badges update from testApi.listeners) =====
+local badges: { [string]: TextLabel } = {}
+local function testRow(parent: Instance, key: string, label: string)
+	local r = mk("Frame", { Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = C.row, BorderSizePixel = 0 }, parent)
+	mk("TextLabel", {
+		Position = UDim2.fromOffset(6, 0), Size = UDim2.new(0.34, -6, 1, 0), BackgroundTransparency = 1, Text = label,
+		TextColor3 = C.text, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, r)
+	button(r, "Run", UDim2.fromScale(0.35, 0.1), UDim2.new(0.12, 0, 0.8, 0), function()
+		task.spawn(runTests, key)
+	end)
+	badges[key] = mk("TextLabel", {
+		Position = UDim2.fromScale(0.5, 0), Size = UDim2.fromScale(0.5, 1), BackgroundTransparency = 1, Text = "not run",
+		TextColor3 = C.dim, Font = Enum.Font.Code, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, r)
+end
+
+-- Tests tab
+local tList = scroller(pTests, UDim2.new(), UDim2.new(1, 0, 1, -36))
+textRow(tList, 20, "Basic exploit simulations", C.dim)
+for _, t in {
+	{ "speed", "WalkSpeed hack" }, { "jump", "JumpPower hack" }, { "teleport", "Teleport hack" },
+	{ "fly", "Fly (BodyVelocity)" }, { "noclip", "Noclip" }, { "health", "Health / MaxHealth" },
+} do
+	testRow(tList, t[1], t[2])
+end
+actionRow(pTests, {
+	{ "Run all", function() task.spawn(runTests, "all") end },
+	{ "Export results", exportResults },
+}, 0).Position = UDim2.new(0, 6, 1, -32)
+
+-- Movement tab
+local mList = scroller(pMove, UDim2.new(), UDim2.new(1, 0, 1, 0))
+textRow(mList, 34, "Subtle movement near your thresholds. Server caps (AntiCheatServer CONFIG): speed 40 studs/s, air rise 12, teleport 60.", C.dim)
+for _, t in { { "human_speed", "Humanized speed" }, { "human_hops", "Short-hop teleport" }, { "human_fly", "Slow burst fly" } } do
+	testRow(mList, t[1], t[2])
+end
+textRow(mList, 20, "Parameters", C.dim)
+local function numRow(parent: Instance, label: string, tbl: { [string]: any }, key: string)
+	local holder = mk("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundColor3 = C.row, BorderSizePixel = 0 }, parent)
+	mk("TextLabel", {
+		Position = UDim2.fromOffset(6, 0), Size = UDim2.new(0.55, -6, 1, 0), BackgroundTransparency = 1, Text = label,
+		TextColor3 = C.text, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+	}, holder)
+	local box = mk("TextBox", {
+		Position = UDim2.fromScale(0.55, 0), Size = UDim2.fromScale(0.45, 1), BackgroundColor3 = C.field, ClearTextOnFocus = false,
+		Text = tostring(tbl[key]), TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.Gotham, TextSize = 12,
+	}, holder)
+	box.FocusLost:Connect(function()
+		local n = tonumber(box.Text)
+		if n then
+			tbl[key] = n
+		end
+		box.Text = tostring(tbl[key])
+	end)
+end
+for _, p in {
+	{ "Duration per test (s)", "HumanDuration" }, { "Speed (studs/s)", "HumanSpeed" }, { "Hop size (studs)", "HopStuds" },
+	{ "Max rise (studs)", "HumanRiseMax" }, { "Rise rate (studs/s)", "HumanRiseRate" },
+} do
+	numRow(mList, p[1], testApi.CONFIG, p[2])
+end
+
+-- Automation tab: repeated, perfectly regular behaviour, run until the server flags it
+local aList = scroller(pAuto, UDim2.new(), UDim2.new(1, 0, 1, 0))
+textRow(aList, 46, "Repeats an identical action until the server flags it, then reports how many attempts that took. Stops at the first flag. Not part of Run all (can take minutes).", C.dim)
+testRow(aList, "auto_path", "Identical patrol lap")
+testRow(aList, "auto_remote", "Fixed-interval remote")
+textRow(aList, 20, "Parameters", C.dim)
+for _, p in {
+	{ "Max attempts", "AutoAttempts" }, { "Remote interval (s)", "AutoInterval" },
+	{ "Patrol distance (studs)", "PatrolStuds" }, { "Patrol speed (studs/s)", "PatrolSpeed" },
+} do
+	numRow(aList, p[1], testApi.CONFIG, p[2])
+end
+textRow(aList, 20, "Remote for the fixed-interval test (full path)", C.dim)
+local autoBox = mk("TextBox", {
+	Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = C.field, ClearTextOnFocus = false,
+	PlaceholderText = "Folder.Sub.RemoteName", Text = testApi.CONFIG.AutoRemote,
+	TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.Gotham, TextSize = 12,
+}, aList)
+autoBox.FocusLost:Connect(function()
+	testApi.CONFIG.AutoRemote = autoBox.Text:match("^%s*(.-)%s*$")
+end)
+
+-- Detections tab
+local detList = scroller(pDet, UDim2.new(), UDim2.new(1, 0, 1, 0))
+local detStatus = textRow(detList, 20, "Server flags (admins only)", C.dim, -1e9)
+local detCount = 0
+local function addDetection(who: string, reason: string, strikes: number, maxStrikes: number)
+	detCount += 1
+	sessionFlags += 1
+	local l = textRow(detList, 20, ("%s  %s  %s (%d/%d)"):format(os.date("%H:%M:%S"), who, reason, strikes, maxStrikes), nil, -detCount)
+	l.Font = Enum.Font.Code
+	if strikes >= maxStrikes then
+		l.BackgroundColor3 = Color3.fromRGB(120, 40, 40)
+	end
+	print(("[ACDetect] %s: %s (%d/%d)"):format(who, reason, strikes, maxStrikes))
+	updateSummary()
+end
+task.spawn(function()
+	local flags = ReplicatedStorage:WaitForChild("ACFlags", 15)
+	if flags and flags:IsA("RemoteEvent") then
+		flags.OnClientEvent:Connect(addDetection)
+	else
+		detStatus.Text = "Server script not found (no ACFlags remote)"
+		detStatus.TextColor3 = C.bad
+	end
+end)
+
+-- Results tab
+local rList = scroller(pRes, UDim2.new(), UDim2.new(1, 0, 1, -36))
+textRow(rList, 20, "History of every test run this session", C.dim, -1e9)
+actionRow(pRes, {
+	{ "Export results", exportResults },
+	{ "Clear", function()
+		for _, c in rList:GetChildren() do
+			if c:IsA("TextLabel") and c.LayoutOrder > -1e9 then
+				c:Destroy()
+			end
+		end
+		table.clear(testApi.results)
+		runCaught, runTotal = 0, 0
+		updateSummary()
+	end },
+}, 0).Position = UDim2.new(0, 6, 1, -32)
+
+local resCount = 0
+testApi.listeners.onResult[#testApi.listeners.onResult + 1] = function(entry)
+	local b = badges[entry.key]
+	if b then
+		b.Text = ("%s  %s"):format(entry.detected and "● CAUGHT" or "○ MISSED", entry.note)
+		b.TextColor3 = entry.detected and C.good or C.bad
+	end
+	runTotal += 1
+	if entry.detected then
+		runCaught += 1
+	end
+	resCount += 1
+	local l = textRow(rList, 20, ("%s  %-26s %s  %s"):format(os.date("%H:%M:%S"), entry.name, entry.detected and "CAUGHT" or "MISSED", entry.note), nil, -resCount)
+	l.Font = Enum.Font.Code
+	l.TextSize = 11
+	if not entry.detected then
+		l.BackgroundColor3 = Color3.fromRGB(110, 40, 40)
+	end
+	updateSummary()
+end
+local wasBusy = false
+testApi.listeners.onStart[#testApi.listeners.onStart + 1] = function(key)
+	if key == "" then
+		wasBusy = false
+		updateSummary()
+		return
+	end
+	if not wasBusy then
+		wasBusy = true
+		runCaught, runTotal = 0, 0
+	end
+	if badges[key] then
+		badges[key].Text = "running..."
+		badges[key].TextColor3 = C.warn
+	end
+	setStatus("Running: " .. key)
+end
+
+-- Remotes tab
+local remList = scroller(pRem, UDim2.new(), UDim2.new(1, 0, 1, 0))
+textRow(remList, 34, "Remote names to fuzz (comma-separated, RemoteEvents under ReplicatedStorage). Sends odd payloads and a 500-call spam.", C.dim)
+local remBox = mk("TextBox", {
+	Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = C.field, ClearTextOnFocus = false, PlaceholderText = "RemoteA, RemoteB",
+	Text = table.concat(testApi.CONFIG.RemoteNames, ", "), TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.Gotham, TextSize = 12,
+}, remList)
+remBox.FocusLost:Connect(function()
+	local names = {}
+	for n in remBox.Text:gmatch("[^,]+") do
+		local trimmed = n:match("^%s*(.-)%s*$")
+		if trimmed ~= "" then
+			table.insert(names, trimmed)
+		end
+	end
+	testApi.CONFIG.RemoteNames = names
+end)
+testRow(remList, "remotes", "Remote fuzz + spam")
+
+-- Settings tab (the existing automation settings)
 local refreshers: { () -> () } = {}
 local function refreshAll()
 	for _, f in refreshers do
 		f()
 	end
 end
-local function styled(inst: GuiObject, h: number)
-	inst.Size = UDim2.new(1, -8, 0, h)
-	inst.BackgroundColor3 = Color3.fromRGB(38, 38, 48)
-	inst.BorderSizePixel = 0
-	inst.Parent = list
-end
+local sList = scroller(pSet, UDim2.new(), UDim2.new(1, 0, 1, 0))
+actionRow(sList, {
+	{ "Save", saveConfig },
+	{ "Load", function() loadConfig(refreshAll) end },
+	{ "Stop all", function() stopAll() refreshAll() end },
+	{ "Reset stats", function() table.clear(counts) totalActions = 0 startTime = os.clock() end },
+}, -1e9)
 
-for _, row in schema do
+for i, row in schema do
 	local key, label = row[1], row[2]
 	if not label then
-		local h = Instance.new("TextLabel")
-		styled(h, 22)
-		h.BackgroundColor3 = Color3.fromRGB(70, 60, 120)
-		h.Text = key
-		h.TextColor3 = Color3.new(1, 1, 1)
+		local h = textRow(sList, 22, key, Color3.new(1, 1, 1), i)
+		h.BackgroundColor3 = C.accent
 		h.Font = Enum.Font.GothamBold
-		h.TextSize = 13
 	elseif typeof(S[key]) == "boolean" then
-		local b = Instance.new("TextButton")
-		styled(b, 24)
-		b.Font = Enum.Font.Gotham
-		b.TextSize = 13
+		local b = mk("TextButton", {
+			Size = UDim2.new(1, 0, 0, 24), BackgroundColor3 = C.row, BorderSizePixel = 0, LayoutOrder = i,
+			Font = Enum.Font.Gotham, TextSize = 13,
+		}, sList)
 		local function refresh()
 			b.Text = ("%s: %s"):format(label, S[key] and "ON" or "OFF")
-			b.TextColor3 = S[key] and Color3.fromRGB(110, 255, 140) or Color3.fromRGB(230, 230, 230)
+			b.TextColor3 = S[key] and C.good or C.text
 		end
 		b.MouseButton1Click:Connect(function()
 			S[key] = not S[key]
@@ -2053,26 +2522,15 @@ for _, row in schema do
 		table.insert(refreshers, refresh)
 		refresh()
 	else
-		local holder = Instance.new("Frame")
-		styled(holder, 24)
-		local l = Instance.new("TextLabel")
-		l.Size = UDim2.new(0.55, 0, 1, 0)
-		l.BackgroundTransparency = 1
-		l.Text = label
-		l.TextColor3 = Color3.fromRGB(210, 210, 210)
-		l.Font = Enum.Font.Gotham
-		l.TextSize = 12
-		l.TextXAlignment = Enum.TextXAlignment.Left
-		l.Parent = holder
-		local box = Instance.new("TextBox")
-		box.Position = UDim2.fromScale(0.55, 0)
-		box.Size = UDim2.fromScale(0.45, 1)
-		box.BackgroundColor3 = Color3.fromRGB(55, 55, 70)
-		box.TextColor3 = Color3.new(1, 1, 1)
-		box.ClearTextOnFocus = false
-		box.Font = Enum.Font.Gotham
-		box.TextSize = 12
-		box.Parent = holder
+		local holder = mk("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundColor3 = C.row, BorderSizePixel = 0, LayoutOrder = i }, sList)
+		mk("TextLabel", {
+			Position = UDim2.fromOffset(6, 0), Size = UDim2.new(0.55, -6, 1, 0), BackgroundTransparency = 1, Text = label,
+			TextColor3 = C.text, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+		}, holder)
+		local box = mk("TextBox", {
+			Position = UDim2.fromScale(0.55, 0), Size = UDim2.fromScale(0.45, 1), BackgroundColor3 = C.field,
+			ClearTextOnFocus = false, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.Gotham, TextSize = 12,
+		}, holder)
 		local isNum = typeof(S[key]) == "number"
 		local function refresh()
 			box.Text = tostring(S[key])
@@ -2093,104 +2551,8 @@ for _, row in schema do
 	end
 end
 
-local bar = Instance.new("Frame")
-bar.Position = UDim2.new(0, 0, 1, -90)
-bar.Size = UDim2.new(1, 0, 0, 90)
-bar.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
-bar.Parent = frame
-
-local stats = Instance.new("TextLabel")
-stats.Size = UDim2.new(1, 0, 0, 28)
-stats.BackgroundTransparency = 1
-stats.TextColor3 = Color3.fromRGB(200, 200, 200)
-stats.Font = Enum.Font.Code
-stats.TextSize = 11
-stats.Parent = bar
-
-local function barButton(text: string, x: number, cb: () -> (), row: number?)
-	local b = Instance.new("TextButton")
-	b.Position = UDim2.new(x, 4, 0, 30 + ((row or 0) * 30))
-	b.Size = UDim2.new(0.25, -8, 0, 26)
-	b.BackgroundColor3 = Color3.fromRGB(70, 60, 120)
-	b.TextColor3 = Color3.new(1, 1, 1)
-	b.Font = Enum.Font.GothamBold
-	b.TextSize = 12
-	b.Text = text
-	b.Parent = bar
-	b.MouseButton1Click:Connect(cb)
-end
-barButton("Save", 0, saveConfig)
-barButton("Load", 0.25, function() loadConfig(refreshAll) end)
-barButton("Stop all", 0.5, function() stopAll() refreshAll() end)
-barButton("Reset stats", 0.75, function() table.clear(counts) totalActions = 0 startTime = os.clock() end)
-barButton("Scan game", 0, function()
-	task.spawn(runScanner)
-end, 1)
-barButton("Run tests", 0.25, function()
-	task.spawn(runTests, "all")
-end, 1)
-
--- ===== DETECTIONS PANEL (server flags from AntiCheatServer) =====
-local detFrame = Instance.new("Frame")
-detFrame.Size = UDim2.fromOffset(380, 300)
-detFrame.Position = UDim2.fromOffset(365, 60)
-detFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
-detFrame.Active = true
-detFrame.Draggable = true
-detFrame.Visible = false
-detFrame.Parent = gui
-
-local detTitle = Instance.new("TextLabel")
-detTitle.Size = UDim2.new(1, 0, 0, 28)
-detTitle.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
-detTitle.TextColor3 = Color3.new(1, 1, 1)
-detTitle.Font = Enum.Font.GothamBold
-detTitle.TextSize = 14
-detTitle.Text = "Detections (server flags)"
-detTitle.Parent = detFrame
-
-local detList = Instance.new("ScrollingFrame")
-detList.Position = UDim2.fromOffset(0, 28)
-detList.Size = UDim2.new(1, 0, 1, -28)
-detList.BackgroundTransparency = 1
-detList.AutomaticCanvasSize = Enum.AutomaticSize.Y
-detList.CanvasSize = UDim2.new()
-detList.ScrollBarThickness = 5
-detList.Parent = detFrame
-local detLayout = Instance.new("UIListLayout")
-detLayout.Padding = UDim.new(0, 2)
-detLayout.SortOrder = Enum.SortOrder.LayoutOrder
-detLayout.Parent = detList
-
-local detCount = 0
-local function addDetection(who: string, reason: string, strikes: number, maxStrikes: number)
-	detCount += 1
-	local l = Instance.new("TextLabel")
-	l.LayoutOrder = -detCount -- newest on top
-	l.Size = UDim2.new(1, -8, 0, 20)
-	l.BackgroundColor3 = strikes >= maxStrikes and Color3.fromRGB(120, 40, 40) or Color3.fromRGB(38, 38, 48)
-	l.BorderSizePixel = 0
-	l.TextColor3 = Color3.fromRGB(230, 230, 230)
-	l.Font = Enum.Font.Code
-	l.TextSize = 12
-	l.TextXAlignment = Enum.TextXAlignment.Left
-	l.Text = ("%s  %s  %s (%d/%d)"):format(os.date("%H:%M:%S"), who, reason, strikes, maxStrikes)
-	l.Parent = detList
-	print(("[ACDetect] %s: %s (%d/%d)"):format(who, reason, strikes, maxStrikes))
-end
-
-task.spawn(function()
-	local flags = ReplicatedStorage:WaitForChild("ACFlags", 15)
-	if flags and flags:IsA("RemoteEvent") then
-		flags.OnClientEvent:Connect(addDetection)
-	else
-		detTitle.Text = "Detections: server script not found"
-	end
-end)
-
-barButton("Detections", 0.5, function()
-	detFrame.Visible = not detFrame.Visible
-end, 1)
+showTab("Tests")
+updateSummary()
 
 task.spawn(function()
 	while task.wait(0.5) do
