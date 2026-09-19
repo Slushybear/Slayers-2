@@ -1617,7 +1617,8 @@ local S = {
 	-- combat
 	AutoFarm = false, BossFarm = false, KillAura = false, AuraRadius = 25,
 	FastAttack = false, AttackSpeedMult = 3, BaseAttackInterval = 0.5,
-	Hitbox = false, HitboxSize = 20,
+	Hitbox = false, HitboxSize = 20,        -- crude: inflate ALL enemy hitboxes to a cube
+	HitboxProject = false,                  -- focused: stretch only the current target to reach you
 	AutoParry = false, ParryRange = 15,
 	AutoSkills = false, SkillKeys = "Z,X,C", SkillInterval = 2,
 	AutoEquip = false, WeaponName = "",
@@ -2161,15 +2162,43 @@ local function dueH(key: string, interval: number): boolean
 	return false
 end
 
-local origHitbox: { [BasePart]: Vector3 } = {}
-local function restoreHitboxes()
-	for part, size in origHitbox do
-		if part.Parent then
-			part.Size = size
-			part.Transparency = 1
+-- Original size AND CFrame per touched part, so a stretched hitbox restores exactly.
+local origHitbox: { [BasePart]: { size: Vector3, cf: CFrame } } = {}
+local function restoreHitboxes(except: BasePart?)
+	for part, orig in origHitbox do
+		if part ~= except then
+			if part.Parent then
+				part.Size = orig.size
+				part.Transparency = 1
+			end
+			origHitbox[part] = nil
 		end
 	end
-	table.clear(origHitbox)
+end
+
+-- Records the part's real size once, so any change can be undone later.
+local function rememberHitbox(part: BasePart)
+	if not origHitbox[part] then
+		origHitbox[part] = { size = part.Size, cf = part.CFrame }
+	end
+end
+
+-- Projects a target's hitbox so it reaches `toward` (the player), covering the vertical gap left
+-- by flying above/below. The part is grown along Y to span from the enemy to the player, and kept
+-- at least `thick` wide, so a swing from the safe offset overlaps it.
+--
+-- IMPORTANT: enemy parts are server-owned, so this size change may not replicate to the server.
+-- It only makes hits land if the game does hit detection on the CLIENT and reports the target -
+-- which is exactly what this is meant to test. If your server does its own hit check, projection
+-- changes nothing, and that MISSED result is the correct, useful answer.
+local function projectHitbox(part: BasePart, toward: Vector3, thick: number)
+	rememberHitbox(part)
+	local gap = math.abs(toward.Y - part.CFrame.Position.Y)
+	local orig = origHitbox[part].size
+	local height = math.max(orig.Y, gap * 2 + thick) -- symmetric grow reaches `toward` on both sides
+	part.Size = Vector3.new(math.max(orig.X, thick), height, math.max(orig.Z, thick))
+	part.Transparency = 0.7
+	part.CanCollide = false
 end
 
 local espFolder = Instance.new("Folder")
@@ -2196,6 +2225,7 @@ local lastFarmTarget: Model? = nil
 -- Set by the farm loop while fighting from below: the ground would otherwise push the character
 -- back out. Independent of the Noclip setting so it switches itself off when combat ends.
 local forceNoclip = false
+local projectedTarget: BasePart? = nil -- current farm target whose hitbox is stretched
 local engageAt = 0
 local lowHP = false
 local breakUntil: number? = nil
@@ -2228,7 +2258,10 @@ local function stopAll()
 	lastFarmTarget = nil
 	runCleanups()
 end
-registerCleanup(restoreHitboxes)
+registerCleanup(function()
+	restoreHitboxes()
+	projectedTarget = nil
+end)
 
 -- ===== QUEST LOOP =====
 -- FindNPC -> GoToNPC -> Accept -> Objective -> Act (locate + perform) -> detect
@@ -2600,18 +2633,18 @@ local function tick(dt: number, root: BasePart, hum: Humanoid)
 		end
 	end
 
-	-- hitbox expander
+	-- Global hitbox expander: inflates every enemy hitbox to a fixed cube (crude reach hack).
 	if S.Hitbox then
 		for _, m in enemies do
 			local r = m:FindFirstChild("HumanoidRootPart") :: BasePart?
 			if r then
-				origHitbox[r] = origHitbox[r] or r.Size
+				rememberHitbox(r)
 				r.Size = Vector3.one * S.HitboxSize
 				r.Transparency = 0.7
 				r.CanCollide = false
 			end
 		end
-	elseif next(origHitbox) then
+	elseif next(origHitbox) and not S.HitboxProject then
 		restoreHitboxes()
 	end
 
@@ -2678,15 +2711,32 @@ local function tick(dt: number, root: BasePart, hum: Humanoid)
 			else
 				faceTarget(r.Position, pitch)
 			end
-			-- Range is checked BEFORE dueH: dueH consumes its timer when it returns true, so
-			-- testing it first would silently eat swings while still closing the distance.
-			if (r.Position - root.Position).Magnitude <= S.AttackRange and dueH("farmAttack", interval) then
+			-- Project the target's hitbox up/down to reach us, so a swing from the safe offset
+			-- still overlaps it. Only the current target is stretched; others are restored.
+			if S.HitboxProject then
+				projectHitbox(r, root.Position, S.HitboxSize)
+				restoreHitboxes(r) -- undo any previously-projected target
+				projectedTarget = r
+			end
+			-- Range check uses horizontal distance when projecting: the whole point is that the
+			-- vertical gap no longer matters, so measuring the full 3D distance would block the
+			-- swing the projection was meant to enable. Checked BEFORE dueH (which consumes its
+			-- timer on success) so we don't eat swings while still closing in.
+			local reach = S.HitboxProject
+				and Vector3.new(r.Position.X - root.Position.X, 0, r.Position.Z - root.Position.Z).Magnitude
+				or (r.Position - root.Position).Magnitude
+			if reach <= S.AttackRange and dueH("farmAttack", interval) then
 				attack(farmTarget)
 				bump("farm")
 			end
 		end
 	end
 	forceNoclip = wantNoclip -- drops back automatically when there is no target / mode changes
+	-- projection left a target stretched but we are no longer farming it: restore it
+	if projectedTarget and (not farmTarget or not S.HitboxProject) then
+		restoreHitboxes()
+		projectedTarget = nil
+	end
 
 	-- kill aura
 	if S.KillAura and dueH("aura", interval) then
@@ -3837,7 +3887,7 @@ local function buildMenu()
 		{ "Attack" },
 		{ "AutoFarm", "Auto attack / farm" }, { "KillAura", "Kill aura" }, { "AuraRadius", "Aura radius" },
 		{ "FastAttack", "Faster attacks" }, { "AttackSpeedMult", "Attack speed x" }, { "BaseAttackInterval", "Base attack interval (s)" },
-		{ "Hitbox", "Adjustable hitboxes" }, { "HitboxSize", "Hitbox size" },
+		{ "Hitbox", "Expand all enemy hitboxes" }, { "HitboxProject", "Project hitbox to target (for above/below)" }, { "HitboxSize", "Hitbox size / thickness" },
 		{ "Abilities and skills" },
 		{ "AutoSkills", "Auto skills" }, { "SkillKeys", "Skill keys (Z,X,C)" }, { "SkillInterval", "Skill interval (s)" },
 		{ "AutoParry", "Auto parry" }, { "ParryRange", "Parry range" },
