@@ -15,13 +15,28 @@ local TextChatService = game:GetService("TextChatService")
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
 
+-- ===== SELF-IDENTIFICATION (so the scanner doesn't report this tool as game data) =====
+-- The getgc scan walks every live object, which includes this script's own tables and closures.
+-- Without this, the report lists our settings table as "quest data" and our own field names
+-- ("AcceptQuestRemote", "AutoQuest", "ESPNpcs") as strings found in the game.
+local OURS: { [any]: boolean } = {}
+local function claim<T>(t: T): T
+	OURS[t] = true
+	return t
+end
+-- Chunk name of this script; any closure reporting the same source is ours, not the game's.
+local MY_SOURCE: string? = nil
+pcall(function()
+	MY_SOURCE = debug.info(function() end, "s")
+end)
+
 -- ===== GAME STATE RECONSTRUCTION =====
 -- The server is authoritative, but it replicates a lot to the client: objects,
 -- attributes, ValueBases, and UI text. This layer rebuilds useful game info
 -- (stat points, quest objective, quest progress) from those sources, so the
 -- automation needs no hardcoded per-game hooks. Whatever it can reconstruct here
 -- is also information an exploiter can read, which is the point of testing it.
-local GameState = {}
+local GameState = claim({})
 
 local function shown(g: Instance): boolean
 	local cur: Instance? = g
@@ -157,8 +172,38 @@ local KILL_VERBS = { "defeat", "kill", "slay", "hunt", "eliminate" }
 local COLLECT_VERBS = { "collect", "gather", "find", "obtain", "pick up" }
 
 -- Parses on-screen quest text like "Defeat 5 Goblins (2/5)" into an objective.
+-- Quest markers. This game keeps the live objective and the tracked NPCs as children of
+-- PlayerGui.markergui: one child named after the objective ("Defeat 3 bandits") and one per
+-- located NPC, suffixed "-AddedByAreaLocator". That is far more reliable than scraping every
+-- label on screen, which found nothing at all on this game.
+local MARKER_SUFFIX = "-AddedByAreaLocator"
+
+function GameState.questMarkers(): { objective: string?, npcs: { string } }
+	local out: { objective: string?, npcs: { string } } = { objective = nil, npcs = {} }
+	local pg = player:FindFirstChildOfClass("PlayerGui")
+	local gui = pg and pg:FindFirstChild("markergui")
+	if not gui then
+		return out
+	end
+	for _, child in gui:GetChildren() do
+		local n = child.Name
+		local at = n:find(MARKER_SUFFIX, 1, true) -- plain find: the name contains pattern magic
+		if at then
+			table.insert(out.npcs, n:sub(1, at - 1))
+		elseif not out.objective then
+			out.objective = n
+		end
+	end
+	return out
+end
+
 function GameState.questProgress(): { kind: string, target: string, current: number?, needed: number?, text: string }?
 	local texts = GameState.uiTexts()
+	-- the objective marker is the most trustworthy source, so it is parsed first
+	local marker = GameState.questMarkers().objective
+	if marker then
+		table.insert(texts, 1, marker)
+	end
 	for _, raw in texts do
 		local low = raw:lower()
 		for _, group in { { KILL_VERBS, "kill" }, { COLLECT_VERBS, "collect" } } do
@@ -218,10 +263,14 @@ function GameState.questComplete(): boolean?
 	return nil
 end
 
+local comboIdx = 0
+local lastSwing = 0
+
 -- ===== ADAPTER: wire these to YOUR game =====
 -- Remotes are looked up by name anywhere under ReplicatedStorage. Leave "" to skip.
 local ADAPT = {
-	AttackRemote = "",      -- fired as AttackRemote:FireServer(unpack(BuildAttackArgs(enemy)))
+	-- From the scan's recorded call: SignalEvent.Event("Combat_Service", "Combat", combo, false, 0.13, false, nil)
+	AttackRemote = "Communication.ServerAndClient.Signals.SignalEvent.Event", -- fired as AttackRemote:FireServer(unpack(BuildAttackArgs(enemy)))
 	ParryRemote = "",
 	SkillRemote = "",       -- if "", skills are sent as key presses instead
 	StatRemote = "",        -- fired as StatRemote:FireServer(statName, amount)
@@ -230,8 +279,11 @@ local ADAPT = {
 	CompleteQuestRemote = "",
 	-- Quest loop hooks. All optional; defaults are guesses until you fill them in.
 	-- Name of the NPC model that gives/claims a quest.
-	QuestNPCName = function(questName: string): string
-		return questName
+	-- Return the NPC model name for a quest, or "" to let the loop work it out from the game's
+	-- own quest markers. Returning the quest name was a bad default: objectives read like
+	-- "Defeat 3 bandits", which matches no NPC and made findNPC fall through every time.
+	QuestNPCName = function(_questName: string): string
+		return ""
 	end,
 	-- Return { kind = "kill" | "collect", target = "<enemy or item name>" } for the active quest.
 	-- Read it from your quest UI/attributes; default = kill anything.
@@ -247,8 +299,19 @@ local ADAPT = {
 	IsQuestComplete = function(questName: string): boolean?
 		return GameState.questComplete()
 	end,
-	BuildAttackArgs = function(enemy: Model): { any }
-		return { enemy }
+	-- The recorded call carries no target, so the server resolves the hit itself (facing / range).
+	-- Set `n` because the last argument is an explicit nil. The combo index cycles 1-4 (character
+	-- attribute last_combo topped out at 4 in the scan); the 0.13 is copied as recorded.
+	BuildAttackArgs = function(_enemy: Model): { any }
+		-- A real combo resets when you stop swinging; replaying 1-2-3-4 forever across a pause is
+		-- an obvious desync from what the client's own combat script would send.
+		local now = os.clock()
+		if now - lastSwing > 1.5 then
+			comboIdx = 0
+		end
+		lastSwing = now
+		comboIdx = comboIdx % 4 + 1
+		return { "Combat_Service", "Combat", comboIdx, false, 0.13, false, nil, n = 7 }
 	end,
 	-- Return the number of unspent stat points (read your leaderstats / attribute).
 	GetStatPoints = function(): number
@@ -530,10 +593,11 @@ local function runMoveTest(name: string, duration: number, step: (root: BasePart
 	log("Running: " .. name)
 	local startChar = char
 	flagCount = 0
+	local resets = 0
 	local t0 = os.clock()
 	local isCont = continuous
 	local lastProgress = 0
-	while player.Character == startChar and hum.Health > 0 do
+	while true do
 		local elapsed = os.clock() - t0
 		if isCont then
 			if stopRequested then
@@ -541,6 +605,18 @@ local function runMoveTest(name: string, duration: number, step: (root: BasePart
 			end
 		elseif elapsed >= duration then
 			break
+		end
+		-- A reset is a detection, not the end of the run. In toggle mode the point is to keep
+		-- applying pressure, so re-acquire the new character and carry on; a one-shot Run still
+		-- stops, because the reset is the result it was measuring.
+		if player.Character ~= startChar or hum.Health <= 0 or not root.Parent then
+			if not isCont then
+				break
+			end
+			resets += 1
+			char, hum, root = getChar()
+			startChar = char
+			task.wait(0.5)
 		end
 		local dt = RunService.Heartbeat:Wait()
 		step(root, dt, elapsed)
@@ -551,12 +627,14 @@ local function runMoveTest(name: string, duration: number, step: (root: BasePart
 	end
 	task.wait(CONFIG.ReactWindow)
 
-	local reset = player.Character ~= startChar or hum.Health <= 0
-	local detected = flagCount > 0 or reset
-	local note = ("%d flag(s) over %ds%s"):format(flagCount, os.clock() - t0, reset and ", character reset" or "")
+	local ended = player.Character ~= startChar or hum.Health <= 0
+	local resetCount = resets + (ended and 1 or 0)
+	local detected = flagCount > 0 or resetCount > 0
+	local note = ("%d flag(s) over %ds%s"):format(
+		flagCount, os.clock() - t0, resetCount > 0 and (", %d character reset(s)"):format(resetCount) or "")
 	record(name, detected, note)
 	log(("%s -> %s (%s)"):format(name, detected and "CAUGHT" or "MISSED", note))
-	if reset then
+	if ended then
 		player.CharacterAdded:Wait()
 	end
 end
@@ -651,14 +729,24 @@ local function runRepeatTest(name: string, attempt: (n: number) -> ())
 	flagCount = 0
 	local firstAt: number? = nil
 	local n = 0
+	local resets = 0
 	local isCont = continuous
-	while player.Character == char and hum.Health > 0 do
+	while true do
 		if isCont then
 			if stopRequested then
 				break
 			end
 		elseif n >= CONFIG.AutoAttempts or firstAt then
 			break
+		end
+		-- keep applying pressure across resets while toggled on (see runMoveTest)
+		if player.Character ~= char or hum.Health <= 0 then
+			if not isCont then
+				break
+			end
+			resets += 1
+			char, hum = getChar()
+			task.wait(0.5)
 		end
 		n += 1
 		attempt(n)
@@ -670,16 +758,17 @@ local function runRepeatTest(name: string, attempt: (n: number) -> ())
 		end
 	end
 	task.wait(CONFIG.ReactWindow) -- the server checks on an interval, so allow late flags
-	local reset = player.Character ~= char or hum.Health <= 0
+	local ended = player.Character ~= char or hum.Health <= 0
+	local resetCount = resets + (ended and 1 or 0)
 	if not firstAt and flagCount > 0 then
 		firstAt = n
 	end
-	local detected = firstAt ~= nil or reset
+	local detected = firstAt ~= nil or resetCount > 0
 	local note = firstAt and ("first flag after %d attempt(s), %d flag(s) total"):format(firstAt, flagCount)
 		or ("no flag after %d attempts"):format(n)
-	record(name, detected, note .. (reset and ", character reset" or ""))
+	record(name, detected, note .. (resetCount > 0 and (", %d reset(s)"):format(resetCount) or ""))
 	log(("%s -> %s (%s)"):format(name, detected and "CAUGHT" or "MISSED", note))
-	if reset then
+	if ended then
 		player.CharacterAdded:Wait()
 	end
 end
@@ -689,18 +778,25 @@ tests.auto_path = function()
 	local _, _, root0 = getChar()
 	local a = root0.Position
 	local b = a + Vector3.new(CONFIG.PatrolStuds, 0, 0)
-	local function glide(root: BasePart, from: Vector3, to: Vector3)
-		local dur = (to - from).Magnitude / CONFIG.PatrolSpeed
+	-- The root is re-read every frame: holding the one captured at the start would keep writing
+	-- to a destroyed part after a respawn, which is exactly what a long toggled run provokes.
+	local function glide(from: Vector3, to: Vector3)
+		local dur = (to - from).Magnitude / math.max(CONFIG.PatrolSpeed, 0.1)
 		local t = 0
-		local rot = root.CFrame - root.CFrame.Position
 		while t < dur do
 			t += RunService.Heartbeat:Wait()
+			local c = player.Character
+			local root = c and c:FindFirstChild("HumanoidRootPart") :: BasePart?
+			if not root then
+				return
+			end
+			local rot = root.CFrame - root.CFrame.Position
 			root.CFrame = CFrame.new(from:Lerp(to, math.min(t / dur, 1))) * rot
 		end
 	end
 	runRepeatTest("Automation: identical patrol lap", function()
-		glide(root0, a, b)
-		glide(root0, b, a)
+		glide(a, b)
+		glide(b, a)
 	end)
 end
 
@@ -976,7 +1072,9 @@ local function gcScan()
 			task.wait() -- keep the client responsive
 		end
 		local t = type(v)
-		if t == "table" then
+		if OURS[v] then
+			-- our own settings / adapter / tester tables
+		elseif t == "table" then
 			pcall(function()
 				local hits, n = 0, 0
 				for k, val in next, v do -- next: no metamethods triggered
@@ -1007,6 +1105,9 @@ local function gcScan()
 					return
 				end
 				local owner = debug.info(v, "s")
+				if MY_SOURCE and owner == MY_SOURCE then
+					return -- one of our own closures; its constants are our strings, not the game's
+				end
 				if env.getupvalues then
 					for _, up in env.getupvalues(v) do
 						if isRemote(up) then
@@ -1209,7 +1310,22 @@ if not (env.hookmetamethod and env.getnamecallmethod) then
 end
 
 local recording = true
-local logged: { [string]: { count: number, sample: string } } = {}
+-- Calls are grouped per remote AND per "selector" - the first string argument. Games commonly
+-- multiplex everything through one remote (here: SignalEvent.Event("Combat_Service", ...)), so
+-- keeping a single sample per remote threw away every distinct action but one. Each selector is
+-- now tracked separately, which is what makes the quest / skill / sell calls visible at all.
+type Variant = { count: number, sample: string, alt: string? }
+type Logged = { count: number, variants: { [string]: Variant } }
+local logged: { [string]: Logged } = {}
+local MAX_VARIANTS = 24
+
+local function nextVariantSlot(entry: Logged): boolean
+	local n = 0
+	for _ in entry.variants do
+		n += 1
+	end
+	return n < MAX_VARIANTS
+end
 
 local totalCalls = 0
 local function logCall(self: any, ...)
@@ -1220,16 +1336,30 @@ local function logCall(self: any, ...)
 	end
 	local key = self:GetFullName()
 	local sig = key .. "(" .. table.concat(parts, ", ") .. ")"
+	-- selector: first string arg, else first arg's type, else none
+	local selector = "(no selector)"
+	if args.n > 0 then
+		if type(args[1]) == "string" then
+			selector = args[1]
+		else
+			selector = "<" .. typeof(args[1]) .. ">"
+		end
+	end
 	totalCalls += 1
 	local entry = logged[key]
 	if not entry then
-		logged[key] = { count = 1, sample = sig }
-	else
-		entry.count += 1
-		-- keep up to one extra differing sample so argument variation is visible
-		if entry.sample ~= sig and not entry.sample:find("\n", 1, true) then
-			entry.sample ..= "\n      alt: " .. sig
+		entry = { count = 0, variants = {} }
+		logged[key] = entry
+	end
+	entry.count += 1
+	local v = entry.variants[selector]
+	if v then
+		v.count += 1
+		if v.sample ~= sig and not v.alt then
+			v.alt = sig -- one differing sample per selector shows which args vary
 		end
+	elseif nextVariantSlot(entry) then
+		entry.variants[selector] = { count = 1, sample = sig }
 	end
 end
 
@@ -1277,11 +1407,27 @@ end
 recording = false
 
 add("--- Recorded outgoing remote calls (what YOU triggered manually) ---")
+add("Grouped by first argument, which for multiplexed remotes is the action selector.")
 local any = false
 for name, entry in logged do
 	any = true
-	data.recorded[name] = { count = entry.count, sample = entry.sample }
-	add(("%s  x%d\n      e.g. %s"):format(name, entry.count, entry.sample))
+	add(("%s  x%d"):format(name, entry.count))
+	-- busiest selectors first: the action you repeated most is usually the one you were after
+	local sels = {}
+	for sel in entry.variants do
+		table.insert(sels, sel)
+	end
+	table.sort(sels, function(a, b)
+		return entry.variants[a].count > entry.variants[b].count
+	end)
+	for _, sel in sels do
+		local v = entry.variants[sel]
+		add(("    [%s] x%d\n        %s"):format(sel, v.count, v.sample))
+		if v.alt then
+			add(("        alt: %s"):format(v.alt))
+		end
+		data.recorded[name .. "|" .. sel] = { count = v.count, sample = v.sample }
+	end
 end
 if not any then
 	add("(nothing recorded, hook may not have fired)")
@@ -1293,6 +1439,8 @@ applyScanData()
 end
 
 local runTests, testApi = setupTester()
+claim(testApi.CONFIG)
+claim(ADAPT)
 
 -- ===== SETTINGS (defaults) =====
 local S = {
@@ -1304,7 +1452,11 @@ local S = {
 	AutoSkills = false, SkillKeys = "Z,X,C", SkillInterval = 2,
 	AutoEquip = false, WeaponName = "",
 	-- targeting
-	Targets = "", BossNames = "Boss", TargetPriority = "nearest", -- nearest | lowest
+	Targets = "", BossNames = "Boss", TargetPriority = "nearest", -- nearest | lowest | highest | weakest
+	-- never engaged even when they classify as an enemy (training dummies, townsfolk, mounts)
+	ExcludeNames = "Civilian,statue,Horse,Dummy,Trainer,Trainee",
+	AttackRange = 12, -- don't swing from further than this (a miss is a wasted, flaggable action)
+	LeashRange = 120, -- give up on the current target once it gets this far away
 	-- quests
 	AutoQuest = false, QuestName = "", SideQuests = false, SideQuestName = "", QuestActionSeconds = 30,
 	-- stats
@@ -1319,6 +1471,8 @@ local S = {
 	-- visuals / utility
 	ESP = false, ESPEnemies = true, ESPBosses = true, ESPNpcs = true, ESPLoot = true, ESPPrompts = true, ESPPlayers = true,
 	ESPDistance = true, ESPMaxDist = 300,
+	ESPRefresh = 0.5,       -- seconds between ESP refreshes (adornments update in place)
+	ESPMaxHighlights = 30,  -- Roblox stops drawing Highlights past ~31; text labels still show
 	UIScale = 1, UIOpacity = 0,
 	Fullbright = false, AntiIdle = true,
 	Humanize = true, HumanizeStrength = 0.15, Breaks = false, SmartFarm = true,
@@ -1327,8 +1481,10 @@ local S = {
 	BreakMin = 20, BreakMax = 90, BreakEveryMin = 600, BreakEveryMax = 1320,
 	LootDelay = 0.7, LootRange = 8,
 	Speed = false, SpeedMult = 1.5, SpeedRamp = 4, FlightSmoothing = 3,
+	ScanInterval = 1, -- seconds between world scans (raise on big maps if the client stutters)
 	DebugState = false, Recovery = true, RecoverDelay = 3, MaxMinutes = 0, MaxActions = 0, -- 0 = unlimited
 }
+claim(S)
 
 local counts: { [string]: number } = {}
 local totalActions = 0
@@ -1360,26 +1516,59 @@ local function matches(name: string, list: { string }): boolean
 	return false
 end
 
-local remoteCache: { [string]: Instance? } = {}
+-- Resolves a remote by dotted path ("Folder.Sub.Event") or bare name (recursive search).
+-- Misses are cached too: a bare-name miss costs a full recursive walk of ReplicatedStorage, and
+-- without this the combat loop paid for that walk on every single frame.
+local remoteCache: { [string]: Instance } = {}
+local remoteMiss: { [string]: number } = {}
+local REMOTE_RETRY = 5 -- seconds before re-searching for a name that wasn't found
+
 local function remote(name: string): Instance?
 	if name == "" then
 		return nil
 	end
-	if not remoteCache[name] or not (remoteCache[name] :: Instance).Parent then
-		-- accepts a bare name (searched recursively) or a dotted path under ReplicatedStorage
-		local cur: Instance? = ReplicatedStorage
-		for part in name:gmatch("[^%.]+") do
-			cur = cur and cur:FindFirstChild(part)
-		end
-		remoteCache[name] = cur or ReplicatedStorage:FindFirstChild(name, true)
+	local hit = remoteCache[name]
+	if hit and hit.Parent then
+		return hit
 	end
-	return remoteCache[name]
+	remoteCache[name] = nil
+	local missedAt = remoteMiss[name]
+	if missedAt and os.clock() - missedAt < REMOTE_RETRY then
+		return nil
+	end
+	local cur: Instance? = ReplicatedStorage
+	for part in name:gmatch("[^%.]+") do
+		cur = cur and cur:FindFirstChild(part)
+	end
+	local found = cur or ReplicatedStorage:FindFirstChild(name, true)
+	if found then
+		remoteCache[name] = found
+		remoteMiss[name] = nil
+		return found
+	end
+	remoteMiss[name] = os.clock()
+	return nil
 end
 
-local function fire(name: string, ...)
+-- Fires a RemoteEvent, or invokes a RemoteFunction. This game routes a lot through
+-- SignalFunction (a RemoteFunction), so event-only firing silently dropped those calls.
+-- InvokeServer yields and can block forever if the server never replies, so it runs detached.
+local function fire(name: string, ...): boolean
 	local r = remote(name)
-	if r and r:IsA("RemoteEvent") then
-		r:FireServer(...)
+	if not r then
+		return false
+	end
+	if r:IsA("RemoteEvent") or r:IsA("UnreliableRemoteEvent") then
+		local ok = pcall(function(...)
+			(r :: RemoteEvent):FireServer(...)
+		end, ...)
+		return ok
+	elseif r:IsA("RemoteFunction") then
+		task.spawn(function(...)
+			pcall(function(...)
+				(r :: RemoteFunction):InvokeServer(...)
+			end, ...)
+		end, ...)
 		return true
 	end
 	return false
@@ -1403,12 +1592,14 @@ local pickupItems: { BasePart } = {}
 local npcClassCount: { [string]: number } = {}
 local otherNpcs: { Model } = {}
 local promptItems: { ProximityPrompt } = {}
+local scanCost = 0 -- ms spent in the last world scan, shown in the menu diagnostics
 
 local function scan()
 	local e, l, c, p, pr = {}, {}, {}, {}, {}
 	table.clear(npcClassCount)
 	local o: { Model } = {}
 	local targets = split(S.Targets)
+	local excluded = split(S.ExcludeNames)
 	local lootN, chestN = split(S.LootNames), split(S.ChestNames)
 	-- items are also collected when only the ESP wants to label them
 	local wantLoot = S.AutoLoot or (S.ESP and S.ESPLoot)
@@ -1421,10 +1612,14 @@ local function scan()
 			if hum and not Players:GetPlayerFromCharacter(d) then
 				local cls = GameState.classifyNPC(d)
 				npcClassCount[cls] = (npcClassCount[cls] or 0) + 1
-				-- combat only ever sees enemies; quest givers, merchants, guards etc. are skipped
-				if cls == "enemy" and hum.Health > 0 and matches(d.Name, targets) then
+				-- combat only ever sees enemies; quest givers, merchants, guards etc. are skipped.
+				-- ExcludeNames additionally drops things that classify as hostile but shouldn't be
+				-- hit (townsfolk, training dummies, mounts) - attacking those is both useless and
+				-- an obvious tell.
+				local skip = #excluded > 0 and matches(d.Name, excluded)
+				if cls == "enemy" and hum.Health > 0 and not skip and matches(d.Name, targets) then
 					table.insert(e, d)
-				elseif cls ~= "enemy" then
+				elseif cls ~= "enemy" or skip then
 					table.insert(o, d)
 				end
 			elseif not hum then
@@ -1462,23 +1657,60 @@ local function rootOf(m: Instance): BasePart?
 	return nil
 end
 
+-- Target stickiness: a real player commits to one enemy until it dies or gets away. Re-picking
+-- every frame makes two equidistant enemies flip-flop, so nothing ever actually dies - and
+-- constant target switching is itself a strong automation signal.
+local stickyTarget: Model? = nil
+
+local function targetScore(m: Model, hum: Humanoid, r: BasePart, root: BasePart): number
+	local mode = S.TargetPriority:lower()
+	if mode == "lowest" then
+		return hum.Health
+	elseif mode == "highest" then
+		return -hum.Health
+	elseif mode == "weakest" then -- lowest absolute HP, then nearest as a tie-break
+		return hum.Health * 1000 + (r.Position - root.Position).Magnitude
+	end
+	return (r.Position - root.Position).Magnitude -- "nearest" (default)
+end
+
+local function alive(m: Model?): (Humanoid?, BasePart?)
+	if not (m and m.Parent) then
+		return nil, nil
+	end
+	local hum = m:FindFirstChildOfClass("Humanoid")
+	local r = rootOf(m)
+	if hum and hum.Health > 0 and r then
+		return hum, r
+	end
+	return nil, nil
+end
+
 local function pickTarget(bossOnly: boolean): Model?
 	local root = getRoot()
 	if not root then
 		return nil
 	end
 	local bossN = split(S.BossNames)
+	-- keep the current target while it is alive and still in range
+	local sHum, sRoot = alive(stickyTarget)
+	if sHum and sRoot and table.find(enemies, stickyTarget) then
+		if (sRoot.Position - root.Position).Magnitude <= S.LeashRange
+			and (not bossOnly or matches((stickyTarget :: Model).Name, bossN)) then
+			return stickyTarget
+		end
+	end
 	local best, bestScore = nil, math.huge
 	for _, m in enemies do
-		local hum = m:FindFirstChildOfClass("Humanoid")
-		local r = rootOf(m)
-		if hum and hum.Health > 0 and r and (not bossOnly or matches(m.Name, bossN)) then
-			local score = S.TargetPriority == "lowest" and hum.Health or (r.Position - root.Position).Magnitude
+		local hum, r = alive(m)
+		if hum and r and (not bossOnly or matches(m.Name, bossN)) then
+			local score = targetScore(m, hum, r, root)
 			if score < bestScore then
 				best, bestScore = m, score
 			end
 		end
 	end
+	stickyTarget = best
 	return best
 end
 
@@ -1501,13 +1733,29 @@ local function human(base: number): number
 end
 
 -- ===== ACTIONS =====
-local function moveToward(goal: Vector3, dt: number)
+-- Builds a CFrame at `pos` facing `lookAt` (flattened to the XZ plane, so the character stays
+-- upright). Falls back to `fallback`'s rotation when there is nothing meaningful to face,
+-- which matters because writing CFrame.new(pos) would silently drop all orientation.
+local function facing(pos: Vector3, lookAt: Vector3?, fallback: CFrame): CFrame
+	if lookAt then
+		local flat = Vector3.new(lookAt.X - pos.X, 0, lookAt.Z - pos.Z)
+		if flat.Magnitude > 0.05 then
+			return CFrame.lookAt(pos, pos + flat.Unit)
+		end
+	end
+	return CFrame.new(pos) * (fallback - fallback.Position) -- keep current rotation
+end
+
+-- `lookAt` keeps the character oriented at a point (normally the enemy) independently of the
+-- direction of travel. Combat relies on this: the game's attack call carries no target, so the
+-- server resolves hits from where the character is facing.
+local function moveToward(goal: Vector3, dt: number, lookAt: Vector3?)
 	local root = getRoot()
 	if not root then
 		return
 	end
 	if S.InstantTravel then
-		root.CFrame = CFrame.new(goal)
+		root.CFrame = facing(goal, lookAt, root.CFrame)
 	else
 		local delta = goal - root.Position
 		local speed = S.TweenSpeed
@@ -1523,24 +1771,40 @@ local function moveToward(goal: Vector3, dt: number)
 		end
 		local step = speed * dt
 		local pos = delta.Magnitude <= step and goal or root.Position + delta.Unit * step + lateral
-		local flat = Vector3.new(delta.X, 0, delta.Z)
-		root.CFrame = flat.Magnitude > 0.1 and CFrame.lookAt(pos, pos + flat) or CFrame.new(pos)
+		-- face the explicit target if given, else the direction of travel, else keep facing
+		root.CFrame = facing(pos, lookAt or (delta.Magnitude > 0.1 and goal or nil), root.CFrame)
 	end
 	root.AssemblyLinearVelocity = Vector3.zero
 end
 
+-- Turns to face a target without moving (used when already in range).
+local function faceTarget(at: Vector3)
+	local root = getRoot()
+	if root then
+		root.CFrame = facing(root.Position, at, root.CFrame)
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+end
+
+-- Three ways to swing, tried in order, so the client works whether the game is remote-driven,
+-- Tool-driven, or reads M1 in a local script. `attackMode` reports which one actually fired so
+-- the menu can show it instead of leaving you guessing why nothing is dying.
+local attackMode = "none"
+
 local function attack(enemy: Model)
 	if ADAPT.AttackRemote ~= "" then
-		local r = remote(ADAPT.AttackRemote)
-		if r and r:IsA("RemoteEvent") then
-			r:FireServer(table.unpack(ADAPT.BuildAttackArgs(enemy)))
+		local args = ADAPT.BuildAttackArgs(enemy) :: any
+		if fire(ADAPT.AttackRemote, table.unpack(args, 1, args.n or #args)) then
+			attackMode = "remote"
 			bump("attack")
 			return
 		end
 	end
-	local tool = player.Character and player.Character:FindFirstChildOfClass("Tool")
+	local char = player.Character
+	local tool = char and char:FindFirstChildOfClass("Tool")
 	if tool then
 		tool:Activate()
+		attackMode = "tool"
 		bump("attack")
 		return
 	end
@@ -1552,8 +1816,11 @@ local function attack(enemy: Model)
 		vim:SendMouseButtonEvent(c.X, c.Y, 0, true, game, 0)
 		vim:SendMouseButtonEvent(c.X, c.Y, 0, false, game, 0)
 	end) then
+		attackMode = "click"
 		bump("attack")
+		return
 	end
+	attackMode = "none"
 end
 
 local function collect(obj: Instance, feature: string, dt: number)
@@ -1622,6 +1889,23 @@ end
 
 local espFolder = Instance.new("Folder")
 espFolder.Name = "ACMenuESP"
+-- Pooled ESP adornments, keyed by the thing being labelled, so refreshes update in place.
+type EspEntry = { bb: BillboardGui, label: TextLabel, hl: Highlight? }
+local espPool: { [Instance]: EspEntry } = {}
+local espSeen: { [Instance]: boolean } = {}
+local espHighlights = 0
+
+local function clearESP()
+	for _, entry in espPool do
+		entry.bb:Destroy()
+		if entry.hl then
+			entry.hl:Destroy()
+		end
+	end
+	table.clear(espPool)
+	table.clear(espSeen)
+	espHighlights = 0
+end
 local flightBV: BodyVelocity? = nil
 local lastFarmTarget: Model? = nil
 local engageAt = 0
@@ -1629,6 +1913,20 @@ local lowHP = false
 local breakUntil: number? = nil
 local nextBreak = os.clock() + 600
 local baseSpeed: number? = nil
+
+-- Cleanup handlers registered by features that change world/character state. Switching a feature
+-- off has to undo it: a half-reverted hitbox or a still-flying BodyVelocity silently poisons
+-- every test that runs afterwards.
+local cleanups: { () -> () } = {}
+local function registerCleanup(fn: () -> ())
+	table.insert(cleanups, fn)
+end
+
+local function runCleanups()
+	for _, fn in cleanups do
+		pcall(fn)
+	end
+end
 
 local function stopAll()
 	for k, v in S do
@@ -1638,7 +1936,11 @@ local function stopAll()
 			S[k] = false
 		end
 	end
+	stickyTarget = nil
+	lastFarmTarget = nil
+	runCleanups()
 end
+registerCleanup(restoreHitboxes)
 
 -- ===== QUEST LOOP =====
 -- FindNPC -> GoToNPC -> Accept -> Objective -> Act (locate + perform) -> detect
@@ -1672,26 +1974,45 @@ local function nextQuestName(): string?
 		table.insert(list, S.SideQuestName)
 	end
 	if #list == 0 then
+		-- Nothing configured: if a quest is already active, work that one. This lets auto-quest
+		-- run with no setup at all as long as you have accepted something by hand.
+		local marker = GameState.questMarkers().objective
+		if marker then
+			return marker
+		end
 		return nil
 	end
 	Q.idx = (Q.idx - 1) % #list + 1
 	return list[Q.idx]
 end
 
+-- Finds the NPC for a quest, in descending order of confidence:
+--   1. the name ADAPT.QuestNPCName gives, if it yields a non-empty name
+--   2. an NPC the game itself is tracking in markergui (these are the ones with quest markers)
+--   3. any NPC that classifies as a quest giver
 local function findNPC(questName: string): Instance?
-	local want = { ADAPT.QuestNPCName(questName) }
+	local want: { string } = {}
+	local named = ADAPT.QuestNPCName(questName)
+	if named and named ~= "" then
+		table.insert(want, named)
+	end
+	local marked = GameState.questMarkers().npcs
+	local byMarker: Instance? = nil
 	local fallback: Instance? = nil
 	for _, d in workspace:GetDescendants() do
 		if (d:IsA("Model") or d:IsA("BasePart")) and rootOf(d) and not Players:GetPlayerFromCharacter(d) then
-			if matches(d.Name, want) then
+			-- #want == 0 would make matches() return true for everything, so guard it
+			if #want > 0 and matches(d.Name, want) then
 				return d
+			elseif not byMarker and #marked > 0 and matches(d.Name, marked) then
+				byMarker = d
 			elseif not fallback and d:IsA("Model") and d:FindFirstChildOfClass("Humanoid")
 				and GameState.classifyNPC(d) == "quest" then
-				fallback = d -- any recognised quest giver if the named one isn't around
+				fallback = d
 			end
 		end
 	end
-	return fallback
+	return byMarker or fallback
 end
 
 local function interact(npc: Instance)
@@ -1748,7 +2069,8 @@ local function questStep(root: BasePart, dt: number)
 	elseif Q.state == "GoToNPC" or Q.state == "Return" then
 		local part = Q.npc and Q.npc.Parent and rootOf(Q.npc)
 		if not part then
-			return setState("FindNPC")
+			setState("FindNPC")
+			return
 		end
 		if (part.Position - root.Position).Magnitude > 7 then
 			moveToward(part.Position + Vector3.new(0, 0, 4), dt)
@@ -1830,12 +2152,7 @@ local function questStep(root: BasePart, dt: number)
 end
 
 -- ===== MAIN LOOP =====
-RunService.Heartbeat:Connect(function(dt)
-	local root, hum = getRoot(), getHum()
-	if not (root and hum) or hum.Health <= 0 then
-		return
-	end
-
+local function tick(dt: number, root: BasePart, hum: Humanoid)
 	-- session limits
 	if (S.MaxMinutes > 0 and os.clock() - startTime > S.MaxMinutes * 60)
 		or (S.MaxActions > 0 and totalActions >= S.MaxActions) then
@@ -1861,8 +2178,21 @@ RunService.Heartbeat:Connect(function(dt)
 		end
 	end
 
-	if due("scan", 1) then
+	-- The world scan walks every descendant of workspace, which is the single most expensive
+	-- thing this client does. Skip it entirely when no feature actually consumes the results.
+	local needScan = S.AutoFarm or S.BossFarm or S.KillAura or S.AutoSkills or S.AutoParry
+		or S.Hitbox or S.AutoLoot or S.AutoChests or S.AutoPickups or S.ESP or S.AutoQuest or Q.acting
+	if needScan and due("scan", math.max(0.1, S.ScanInterval)) then
+		local t0 = os.clock()
 		scan()
+		scanCost = (os.clock() - t0) * 1000
+	elseif not needScan and #enemies > 0 then
+		table.clear(enemies)
+		table.clear(lootItems)
+		table.clear(chestItems)
+		table.clear(pickupItems)
+		table.clear(otherNpcs)
+		table.clear(promptItems)
 	end
 
 	-- speed: ramped a few studs/sec instead of jumping, so there's no single-frame spike
@@ -1945,8 +2275,17 @@ RunService.Heartbeat:Connect(function(dt)
 			local away = root.Position - r.Position
 			local flat = Vector3.new(away.X, 0, away.Z)
 			local spot = r.Position + (flat.Magnitude > 0.1 and flat.Unit or Vector3.zAxis) * S.FightDistance
-			moveToward(Vector3.new(spot.X, r.Position.Y + S.FarmHeight, spot.Z), dt)
-			if dueH("farmAttack", interval) then
+			local goal = Vector3.new(spot.X, r.Position.Y + S.FarmHeight, spot.Z)
+			-- always face the enemy: the attack call carries no target, so the server
+			-- decides what was hit from facing and range
+			if (root.Position - goal).Magnitude > 0.5 then
+				moveToward(goal, dt, r.Position)
+			else
+				faceTarget(r.Position)
+			end
+			-- Range is checked BEFORE dueH: dueH consumes its timer when it returns true, so
+			-- testing it first would silently eat swings while still closing the distance.
+			if (r.Position - root.Position).Magnitude <= S.AttackRange and dueH("farmAttack", interval) then
 				attack(farmTarget)
 				bump("farm")
 			end
@@ -1958,11 +2297,16 @@ RunService.Heartbeat:Connect(function(dt)
 		for _, m in enemies do
 			local r = rootOf(m)
 			if r and (r.Position - root.Position).Magnitude <= S.AuraRadius then
+				if S.Humanize then
+					-- one target per swing, and turn to it first: a swing that lands on something
+					-- behind you is exactly the tell a server-side facing check looks for
+					faceTarget(r.Position)
+					attack(m)
+					bump("aura")
+					break
+				end
 				attack(m)
 				bump("aura")
-				if S.Humanize then
-					break -- one target per swing; hitting several in one frame is a giveaway
-				end
 			end
 		end
 	end
@@ -2078,40 +2422,61 @@ RunService.Heartbeat:Connect(function(dt)
 	-- ESP
 	if S.ESP then
 		espFolder.Parent = workspace.CurrentCamera
-		if due("esp", 1) then
-			espFolder:ClearAllChildren()
+		if due("esp", S.ESPRefresh) then
 			local bossN = split(S.BossNames)
-			-- label anything: a Highlight (optional, Roblox renders at most ~31) plus a name/distance tag
+			table.clear(espSeen)
+			-- Adornments are pooled and updated in place. Rebuilding them every refresh (the old
+			-- behaviour) created and destroyed hundreds of instances per second on a populated
+			-- map, which churned the GC and made every label visibly flicker.
 			local function mark(target: Instance, color: Color3, label: string, highlight: boolean)
 				local r = rootOf(target)
-				local dist = r and (r.Position - root.Position).Magnitude
-				if dist and S.ESPMaxDist > 0 and dist > S.ESPMaxDist then
+				if not r then
 					return
 				end
-				if highlight then
-					local h = Instance.new("Highlight")
-					h.Adornee = target
-					h.FillColor = color
-					h.Parent = espFolder
+				local dist = (r.Position - root.Position).Magnitude
+				if S.ESPMaxDist > 0 and dist > S.ESPMaxDist then
+					return
 				end
-				if r then
+				espSeen[target] = true
+				local entry = espPool[target]
+				if not entry then
 					local bb = Instance.new("BillboardGui")
-					bb.Adornee = r
 					bb.AlwaysOnTop = true
-					bb.Size = UDim2.fromOffset(200, 18)
+					bb.Size = UDim2.fromOffset(220, 18)
 					bb.StudsOffset = Vector3.new(0, 4, 0)
 					local tl = Instance.new("TextLabel")
 					tl.Size = UDim2.fromScale(1, 1)
 					tl.BackgroundTransparency = 1
-					tl.TextColor3 = color
 					tl.TextStrokeTransparency = 0.4
 					tl.Font = Enum.Font.GothamBold
 					tl.TextSize = 12
-					tl.Text = (S.ESPDistance and dist) and ("%s [%dm]"):format(label, dist) or label
 					tl.Parent = bb
 					bb.Parent = espFolder
+					entry = { bb = bb, label = tl, hl = nil }
+					espPool[target] = entry
+				end
+				entry.bb.Adornee = r
+				entry.label.Text = S.ESPDistance and ("%s [%dm]"):format(label, dist) or label
+				entry.label.TextColor3 = color
+				-- Roblox renders a limited number of Highlights (~31); past that they silently
+				-- stop drawing, so they go to the nearest things and text carries the rest.
+				local wantHl = highlight and espHighlights < S.ESPMaxHighlights
+				if wantHl and not entry.hl then
+					local h = Instance.new("Highlight")
+					h.Adornee = target
+					h.Parent = espFolder
+					entry.hl = h
+				elseif not wantHl and entry.hl then
+					entry.hl:Destroy()
+					entry.hl = nil
+				end
+				if entry.hl then
+					entry.hl.FillColor = color
+					entry.hl.OutlineColor = color
+					espHighlights += 1
 				end
 			end
+			espHighlights = 0
 			for _, m in enemies do
 				local hp = m:FindFirstChildOfClass("Humanoid")
 				local hpText = hp and (" %d/%d"):format(hp.Health, hp.MaxHealth) or ""
@@ -2166,34 +2531,135 @@ RunService.Heartbeat:Connect(function(dt)
 					end
 				end
 			end
-		end
-	else
-		espFolder.Parent = nil
-	end
-end)
-
--- noclip runs on Stepped so it lands before physics
-RunService.Stepped:Connect(function()
-	if S.Noclip and player.Character then
-		for _, p in player.Character:GetDescendants() do
-			if p:IsA("BasePart") then
-				p.CanCollide = false
+			-- sweep: drop adornments for anything that died, despawned or went out of range
+			for target, entry in espPool do
+				if not espSeen[target] then
+					entry.bb:Destroy()
+					if entry.hl then
+						entry.hl:Destroy()
+					end
+					espPool[target] = nil
+				end
 			end
 		end
+	else
+		if next(espPool) then
+			clearESP()
+		end
+		espFolder.Parent = nil
+	end
+end
+
+-- The tick is wrapped so a single failing feature (usually an instance destroyed mid-frame)
+-- cannot abort every feature after it, which previously happened on every frame once anything
+-- started erroring. Errors are reported at most once every few seconds instead of 60x/second.
+RunService.Heartbeat:Connect(function(dt)
+	if revoked then
+		return
+	end
+	local root, hum = getRoot(), getHum()
+	if not (root and hum) or hum.Health <= 0 then
+		return
+	end
+	local ok, err = pcall(tick, dt, root, hum)
+	if not ok and due("tickError", 3) then
+		warn("[AC] main loop error (features continue): " .. tostring(err))
 	end
 end)
 
--- fullbright
+-- Noclip runs on Stepped so it lands before physics. Only parts that were actually colliding are
+-- touched, and they are restored when it is switched off - previously the character stayed
+-- non-solid until the next respawn, which quietly contaminated every later movement test.
+local noclipped: { [BasePart]: boolean } = {}
+local function restoreNoclip()
+	for part in noclipped do
+		if part.Parent then
+			part.CanCollide = true
+		end
+	end
+	table.clear(noclipped)
+end
+
+RunService.Stepped:Connect(function()
+	if revoked then
+		return
+	end
+	if S.Noclip then
+		local char = player.Character
+		if char then
+			for _, p in char:GetDescendants() do
+				if p:IsA("BasePart") and p.CanCollide then
+					noclipped[p] = true
+					p.CanCollide = false
+				end
+			end
+		end
+	elseif next(noclipped) then
+		restoreNoclip()
+	end
+end)
+
+-- Fullbright, with the original lighting captured once so it can be put back.
+local origLighting: { [string]: any }? = nil
+local function restoreLighting()
+	if origLighting then
+		for k, v in origLighting do
+			pcall(function()
+				(Lighting :: any)[k] = v
+			end)
+		end
+		origLighting = nil
+	end
+end
+
 task.spawn(function()
 	while task.wait(1) do
+		if revoked then
+			break
+		end
 		if S.Fullbright then
+			if not origLighting then
+				origLighting = {
+					Brightness = Lighting.Brightness, ClockTime = Lighting.ClockTime,
+					FogEnd = Lighting.FogEnd, GlobalShadows = Lighting.GlobalShadows,
+					Ambient = Lighting.Ambient,
+				}
+			end
 			Lighting.Brightness = 2
 			Lighting.ClockTime = 14
 			Lighting.FogEnd = 1e6
 			Lighting.GlobalShadows = false
 			Lighting.Ambient = Color3.new(1, 1, 1)
+		elseif origLighting then
+			restoreLighting()
 		end
 	end
+end)
+
+registerCleanup(restoreNoclip)
+registerCleanup(restoreLighting)
+registerCleanup(function()
+	if flightBV then
+		flightBV:Destroy()
+		flightBV = nil
+	end
+end)
+registerCleanup(function()
+	espFolder:ClearAllChildren()
+	espFolder.Parent = nil
+end)
+registerCleanup(function()
+	local hum = getHum()
+	if hum and baseSpeed then
+		hum.WalkSpeed = baseSpeed
+	end
+	baseSpeed = nil
+end)
+
+-- Revoking test mode must leave the character exactly as it was found.
+table.insert(teardown, function()
+	stopAll()
+	runCleanups()
 end)
 
 -- anti-idle
@@ -2212,39 +2678,94 @@ player.CharacterAdded:Connect(function()
 	if S.Recovery then
 		bump("recovery")
 		task.wait(S.RecoverDelay)
+		-- The old character took its BodyVelocity and WalkSpeed with it; keeping the stale
+		-- baseSpeed would later "restore" the new character to the wrong value.
 		flightBV = nil
+		baseSpeed = nil
+		table.clear(noclipped)
 		table.clear(timers)
 		print("[ACMenu] Respawned, automation resumed")
 	end
 end)
 
 -- ===== SAVED CONFIGS =====
+-- Saves the feature settings, the per-game remote hookups (ADAPT) and the tester parameters.
+-- Previously only S was persisted, so the remote names and every test threshold were lost on
+-- reload - the settings that take the longest to work out.
 local CONFIG_FILE = "ACMenu_config.json"
-local function saveConfig()
-	if env.writefile then
-		env.writefile(CONFIG_FILE, HttpService:JSONEncode(S))
-		print("[ACMenu] Config saved")
-	else
-		warn("[ACMenu] writefile unavailable (needs an executor)")
+
+-- Only plain scalars round-trip through JSON; ADAPT also holds functions, which are skipped.
+local function scalarsOf(t: { [string]: any }): { [string]: any }
+	local out = {}
+	for k, v in t do
+		local ty = typeof(v)
+		if ty == "string" or ty == "number" or ty == "boolean" then
+			out[k] = v
+		end
+	end
+	return out
+end
+
+local function applyScalars(into: { [string]: any }, from: any)
+	if type(from) ~= "table" then
+		return
+	end
+	for k, v in from do
+		if into[k] ~= nil and typeof(into[k]) == typeof(v) then
+			into[k] = v
+		end
 	end
 end
+
+local function saveConfig()
+	if not env.writefile then
+		warn("[ACMenu] writefile unavailable (needs an executor)")
+		return
+	end
+	local ok, err = pcall(function()
+		env.writefile(CONFIG_FILE, HttpService:JSONEncode({
+			version = 2,
+			settings = scalarsOf(S),
+			adapt = scalarsOf(ADAPT),
+			tester = scalarsOf(testApi.CONFIG),
+			-- kept separately: scalarsOf drops tables, and this list is worth persisting
+			remoteNames = testApi.CONFIG.RemoteNames,
+		}))
+	end)
+	print(ok and "[ACMenu] Config saved (settings + hookups + test parameters)"
+		or ("[ACMenu] Config save failed: " .. tostring(err)))
+end
+
 local function loadConfig(refresh: () -> ())
-	if env.isfile and env.isfile(CONFIG_FILE) then
-		local ok, data = pcall(function()
-			return HttpService:JSONDecode(env.readfile(CONFIG_FILE))
-		end)
-		if ok then
-			for k, v in data do
-				if S[k] ~= nil and typeof(S[k]) == typeof(v) then
-					S[k] = v
+	if not (env.isfile and env.isfile(CONFIG_FILE)) then
+		warn("[ACMenu] No saved config found")
+		return
+	end
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(env.readfile(CONFIG_FILE))
+	end)
+	if not (ok and type(data) == "table") then
+		warn("[ACMenu] Saved config unreadable, ignoring")
+		return
+	end
+	if data.version == nil then
+		applyScalars(S, data) -- v1 files were a bare settings table
+	else
+		applyScalars(S, data.settings)
+		applyScalars(ADAPT, data.adapt)
+		applyScalars(testApi.CONFIG, data.tester)
+		if type(data.remoteNames) == "table" then
+			local names = {}
+			for _, n in data.remoteNames do
+				if type(n) == "string" then
+					table.insert(names, n)
 				end
 			end
-			refresh()
-			print("[ACMenu] Config loaded")
+			testApi.CONFIG.RemoteNames = names
 		end
-	else
-		warn("[ACMenu] No saved config found")
 	end
+	refresh()
+	print("[ACMenu] Config loaded")
 end
 
 -- ===== MENU =====
@@ -2305,10 +2826,47 @@ local function buildMenu()
 	local gui = mk("ScreenGui", { Name = "ACMenu", ResetOnSpawn = false }, (env.gethui and env.gethui()) or player:WaitForChild("PlayerGui"))
 	local frame = mk("Frame", {
 		Size = UDim2.fromOffset(740, 500), Position = UDim2.fromOffset(20, 60),
-		BackgroundColor3 = C.bg, BorderSizePixel = 0, Active = true, Draggable = true,
+		BackgroundColor3 = C.bg, BorderSizePixel = 0, Active = true,
 	}, gui)
 
 	local header = mk("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.bar, BorderSizePixel = 0 }, frame)
+
+	-- Dragging by the header. GuiObject.Draggable is deprecated, and it also let the window be
+	-- pulled fully off-screen with no way back; this keeps a strip of the title bar reachable.
+	local function makeDraggable(handle: GuiObject, target: GuiObject)
+		local dragging, startPos, startMouse = false, Vector2.zero, Vector2.zero
+		local function clamp(x: number, y: number): UDim2
+			local cam = workspace.CurrentCamera
+			local view = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+			local w, h = target.AbsoluteSize.X, target.AbsoluteSize.Y
+			return UDim2.fromOffset(
+				math.clamp(x, -w + 80, view.X - 80),
+				math.clamp(y, 0, math.max(0, view.Y - math.min(h, 30)))
+			)
+		end
+		handle.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				startPos = Vector2.new(target.Position.X.Offset, target.Position.Y.Offset)
+				startMouse = Vector2.new(input.Position.X, input.Position.Y)
+			end
+		end)
+		UserInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch) then
+				local d = Vector2.new(input.Position.X, input.Position.Y) - startMouse
+				target.Position = clamp(startPos.X + d.X, startPos.Y + d.Y)
+			end
+		end)
+		UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end)
+	end
+	makeDraggable(header, frame)
 	mk("TextLabel", {
 		Position = UDim2.fromOffset(10, 0), Size = UDim2.new(0.5, 0, 1, 0), BackgroundTransparency = 1,
 		Text = "AC Test Lab  (RightShift hides)", TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold,
@@ -2342,8 +2900,9 @@ local function buildMenu()
 	local reopen = mk("TextButton", {
 		Size = UDim2.fromOffset(40, 24), Position = UDim2.fromOffset(20, 60), BackgroundColor3 = C.accent, BorderSizePixel = 0,
 		Text = "AC", TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 13, Visible = false,
-		Active = true, Draggable = true,
+		Active = true,
 	}, gui)
+	makeDraggable(reopen, reopen)
 	local function setOpen(open: boolean)
 		frame.Visible = open
 		reopen.Visible = not open
@@ -2499,7 +3058,27 @@ local function buildMenu()
 
 	-- Movement tab
 	local mList = scroller(pMove, UDim2.new(), UDim2.new(1, 0, 1, 0))
-	textRow(mList, 34, "Subtle movement near your thresholds. Server caps (AntiCheatServer CONFIG): speed 40 studs/s, air rise 12, teleport 60.", C.dim)
+	local capsRow = textRow(mList, 34, "Subtle movement near your thresholds.", C.dim)
+	-- Read the live thresholds the server publishes, so this never drifts out of date when
+	-- AntiCheatServer's CONFIG is tuned.
+	local function refreshCaps()
+		local parts = {}
+		for _, k in { "MaxWalkSpeed", "MaxSpeedStuds", "MaxTeleport", "MaxAirRise" } do
+			local v = ReplicatedStorage:GetAttribute("ACLimit_" .. k)
+			if v ~= nil then
+				table.insert(parts, ("%s %s"):format(k:gsub("^Max", ""), tostring(v)))
+			end
+		end
+		capsRow.Text = #parts > 0
+			and ("Subtle movement near your thresholds. Your published caps: " .. table.concat(parts, ", "))
+			or "Subtle movement near your thresholds. Your anti-cheat has not published any caps - "
+				.. "call Bridge.setLimits{...} in ACTestBridge to show them here."
+	end
+	refreshCaps()
+	task.spawn(function()
+		task.wait(3) -- attributes may arrive after the menu builds
+		pcall(refreshCaps)
+	end)
 	for _, t in { { "human_speed", "Humanized speed" }, { "human_hops", "Short-hop teleport" }, { "human_fly", "Slow burst fly" } } do
 		testRow(mList, t[1], t[2], true)
 	end
@@ -2768,6 +3347,10 @@ local function buildMenu()
 	} do
 		settingRow(homeList, d[1], d[2])
 	end
+	sectionHeader(homeList, "Diagnostics")
+	local homeDiag = textRow(homeList, 62, "-")
+	homeDiag.Font = Enum.Font.Code
+	homeDiag.TextSize = 11
 
 	buildPage(pCombat, {
 		{ "Attack" },
@@ -2779,16 +3362,18 @@ local function buildMenu()
 		{ "AutoParry", "Auto parry" }, { "ParryRange", "Parry range" },
 		{ "AutoEquip", "Weapon equip" }, { "WeaponName", "Weapon name" },
 		{ "Target selection" },
-		{ "Targets", "Targets (names, comma)" }, { "TargetPriority", "Priority: nearest / lowest" },
+		{ "Targets", "Targets (names, comma)" }, { "ExcludeNames", "Never attack (names, comma)" },
+		{ "TargetPriority", "Priority: nearest/lowest/highest/weakest" }, { "LeashRange", "Drop target beyond (studs)" },
 		{ "Attack preferences" },
-		{ "FightDistance", "Fight distance (studs)" }, { "FarmHeight", "Farm height (offset Y)" },
+		{ "FightDistance", "Fight distance (studs)" }, { "AttackRange", "Max swing range (studs)" },
+		{ "FarmHeight", "Farm height (offset Y)" },
 		{ "SmartFarm", "Retreat at low HP" }, { "RetreatBelow", "Retreat below HP (0-1)" }, { "ResumeAbove", "Resume above HP (0-1)" },
 		{ "ReactionMin", "Reaction delay min (s)" }, { "ReactionMax", "Reaction delay max (s)" },
 		{ "Game hookup (blank = click M1 / press keys)" },
 		{ "AttackRemote", "Attack remote", ADAPT }, { "SkillRemote", "Skill remote", ADAPT }, { "ParryRemote", "Parry remote", ADAPT },
 	})
 
-	buildPage(pQuests, {
+	local questList = buildPage(pQuests, {
 		{ "Quest acceptance and progression" },
 		{ "AutoQuest", "Auto quests" }, { "QuestName", "Quest name" }, { "QuestActionSeconds", "Fallback timer (s)" },
 		{ "Quest priorities" },
@@ -2799,6 +3384,10 @@ local function buildMenu()
 		{ "AcceptQuestRemote", "Accept quest remote", ADAPT }, { "CompleteQuestRemote", "Complete quest remote", ADAPT },
 		{ "StatRemote", "Stat remote", ADAPT },
 	})
+	sectionHeader(questList, "Live quest state (what the loop can actually see)")
+	local questDiag = textRow(questList, 78, "-")
+	questDiag.Font = Enum.Font.Code
+	questDiag.TextSize = 11
 
 	buildPage(pBosses, {
 		{ "Boss selection" },
@@ -2861,8 +3450,15 @@ local function buildMenu()
 		{ "Scan game", function() task.spawn(runScanner) end },
 		{ "Save config", saveConfig },
 		{ "Load config", function() loadConfig(refreshAll) end },
-		{ "Stop all", function() stopAll() refreshAll() end },
-		{ "Reset stats", function() table.clear(counts) totalActions = 0 startTime = os.clock() end },
+		{ "Stop all", function()
+			stopAll()
+			refreshAll()
+		end },
+		{ "Reset stats", function()
+			table.clear(counts)
+			totalActions = 0
+			startTime = os.clock()
+		end },
 	})
 	saveRow.LayoutOrder = -1 -- pin to the top of the Settings list
 
@@ -2905,6 +3501,40 @@ local function buildMenu()
 			p and ("%s %s  %s/%s"):format(p.kind, p.target, tostring(p.current or "?"), tostring(p.needed or "?")) or "no objective detected"
 		)
 		homeSession.Text = ("Session: %s   actions: %d   kills: %d"):format(fmtTime(os.clock() - startTime), totalActions, Q.kills)
+
+		-- Diagnostics answer the usual "it's on but nothing is happening" question directly:
+		-- what the scan found, which attack path is live, and whether the remote resolves.
+		local remoteState = "not set"
+		if ADAPT.AttackRemote ~= "" then
+			local r = remote(ADAPT.AttackRemote)
+			remoteState = r and ("resolved (" .. r.ClassName .. ")") or "NOT FOUND"
+		end
+		-- Quest diagnostics: each line is a prerequisite the loop needs, so a "-" or NOT FOUND
+		-- tells you exactly which step is missing rather than leaving it stuck silently.
+		local mk = GameState.questMarkers()
+		local function questRemoteState(path: string): string
+			if path == "" then
+				return "not set - record one (see Settings > Scan game)"
+			end
+			local r = remote(path)
+			return r and ("ok (" .. r.ClassName .. ")") or "NOT FOUND"
+		end
+		questDiag.Text = table.concat({
+			("state: %s   acting: %s   kills: %d"):format(Q.state, tostring(Q.acting), Q.kills),
+			("marker objective: %s"):format(mk.objective or "- (no active quest marker)"),
+			("marker NPCs: %s"):format(#mk.npcs > 0 and table.concat(mk.npcs, ", ") or "-"),
+			("parsed: %s"):format(p and ("%s %q %s/%s"):format(p.kind, p.target, tostring(p.current or "?"), tostring(p.needed or "?")) or "-"),
+			("accept remote:   %s"):format(questRemoteState(ADAPT.AcceptQuestRemote)),
+			("complete remote: %s"):format(questRemoteState(ADAPT.CompleteQuestRemote)),
+		}, "\n")
+
+		local dist = tgt and rootOf(tgt)
+		homeDiag.Text = table.concat({
+			("enemies:%d  npcs:%d  loot:%d  scan:%.1fms"):format(#enemies, #otherNpcs, #lootItems, scanCost),
+			("attack via: %s   remote: %s"):format(attackMode, remoteState),
+			("target dist: %s  (swing range %d)"):format(
+				dist and ("%.1f"):format((dist.Position - (getRoot() or dist).Position).Magnitude) or "-", S.AttackRange),
+		}, "\n")
 	end
 
 	showTab("Home")
