@@ -39,7 +39,9 @@ end
 --      (or your account is in ALLOWED_USER_IDS - e.g. an alt you test with)
 --   5. anything else                            -> refused
 local OWNER_USER_ID = 4622985887            -- your main account (the game's creator)
-local OWNED_GROUP_IDS: { number } = {}     -- group IDs, if the place is group-owned
+local OWNED_GROUP_IDS: { number } = {       -- group IDs, if the place is group-owned
+	12851171,
+}
 local ALLOWED_USER_IDS: { number } = {     -- alt accounts you test your own game with
 	6068872442,
 }
