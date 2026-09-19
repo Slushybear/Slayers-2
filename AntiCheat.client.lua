@@ -15,22 +15,6 @@ local TextChatService = game:GetService("TextChatService")
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
 
--- Teardown registry. Declared unconditionally and BEFORE the gate below, because the rest of the
--- file uses it: if the gate block gets removed, the file must still load rather than dying with
--- "invalid argument #1 to 'insert' (table expected, got nil)".
-local teardown: { () -> () } = {}
-local revoked = false
-local function revokeAll(reason: string)
-	if revoked then
-		return
-	end
-	revoked = true
-	warn("[AC] " .. reason .. " - shutting down.")
-	for _, fn in teardown do
-		pcall(fn)
-	end
-end
-
 -- ===== SELF-IDENTIFICATION (so the scanner doesn't report this tool as game data) =====
 -- The getgc scan walks every live object, which includes this script's own tables and closures.
 -- Without this, the report lists our settings table as "quest data" and our own field names
@@ -2638,9 +2622,6 @@ end
 -- cannot abort every feature after it, which previously happened on every frame once anything
 -- started erroring. Errors are reported at most once every few seconds instead of 60x/second.
 RunService.Heartbeat:Connect(function(dt)
-	if revoked then
-		return
-	end
 	local root, hum = getRoot(), getHum()
 	if not (root and hum) or hum.Health <= 0 then
 		return
@@ -2665,9 +2646,6 @@ local function restoreNoclip()
 end
 
 RunService.Stepped:Connect(function()
-	if revoked then
-		return
-	end
 	if S.Noclip then
 		local char = player.Character
 		if char then
@@ -2698,9 +2676,6 @@ end
 
 task.spawn(function()
 	while task.wait(1) do
-		if revoked then
-			break
-		end
 		if S.Fullbright then
 			if not origLighting then
 				origLighting = {
@@ -2738,12 +2713,6 @@ registerCleanup(function()
 		hum.WalkSpeed = baseSpeed
 	end
 	baseSpeed = nil
-end)
-
--- Revoking test mode must leave the character exactly as it was found.
-table.insert(teardown, function()
-	stopAll()
-	runCleanups()
 end)
 
 -- anti-idle
@@ -2956,12 +2925,6 @@ local function buildMenu()
 		Text = "AC Test Lab  (RightShift hides)", TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold,
 		TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
 	}, header)
-	mk("TextLabel", {
-		Position = UDim2.fromScale(0.5, 0), Size = UDim2.new(0.5, -70, 1, 0), BackgroundTransparency = 1,
-		Text = ("● Test mode: %s"):format(RunService:IsStudio() and "Studio" or "private server"),
-		TextColor3 = C.good, Font = Enum.Font.GothamBold, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Right,
-	}, header)
-
 	local sidebar = mk("ScrollingFrame", {
 		Position = UDim2.fromOffset(0, 30), Size = UDim2.new(0, 130, 1, -54), BackgroundColor3 = C.side, BorderSizePixel = 0,
 		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3,
